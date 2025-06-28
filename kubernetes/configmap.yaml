@@ -1,0 +1,159 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-mcp-server-config
+  namespace: default
+  labels:
+    app: openshift-mcp-server
+    component: monitoring
+    version: v1.0.0
+data:
+  # MCP Server Configuration
+  server.name: "openshift-mcp-server"
+  server.version: "1.0.0"
+  server.description: "OpenShift/Kubernetes cluster monitoring MCP server"
+  
+  # Monitoring Configuration
+  monitoring.enabled: "true"
+  monitoring.interval: "30"
+  monitoring.timeout: "10"
+  
+  # Cluster Configuration
+  cluster.check_interval: "60"
+  cluster.health_threshold: "80"
+  cluster.resource_threshold_cpu: "85"
+  cluster.resource_threshold_memory: "90"
+  cluster.restart_threshold: "5"
+  
+  # Performance Metrics Configuration
+  metrics.enabled: "true"
+  metrics.retention_hours: "24"
+  metrics.collection_interval: "30"
+  
+  # Logging Configuration
+  log.level: "info"
+  log.format: "json"
+  log.enabled: "true"
+  
+  # Security Configuration
+  security.rbac_enabled: "true"
+  security.service_account: "openshift-mcp-server"
+  
+  # Feature Flags
+  features.cluster_health: "true"
+  features.performance_metrics: "true"
+  features.resource_detection: "true"
+  features.pod_disruption_analysis: "true"
+  features.node_conditions: "true"
+  features.deployment_monitoring: "true"
+  
+  # Alerting Configuration (placeholder for future use)
+  alerting.enabled: "false"
+  alerting.webhook_url: ""
+  alerting.slack_channel: ""
+  
+  # Advanced Configuration
+  advanced.concurrent_requests: "10"
+  advanced.request_timeout: "30000"
+  advanced.cache_ttl: "300"
+  advanced.batch_size: "100"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-mcp-server-scripts
+  namespace: default
+  labels:
+    app: openshift-mcp-server
+    component: monitoring
+    version: v1.0.0
+data:
+  healthcheck.js: |
+    #!/usr/bin/env node
+    
+    // Simple health check script
+    const http = require('http');
+    
+    const options = {
+      hostname: 'localhost',
+      port: 3000,
+      path: '/health',
+      method: 'GET',
+      timeout: 5000
+    };
+    
+    const req = http.request(options, (res) => {
+      if (res.statusCode === 200) {
+        console.log('Health check passed');
+        process.exit(0);
+      } else {
+        console.log('Health check failed:', res.statusCode);
+        process.exit(1);
+      }
+    });
+    
+    req.on('error', (err) => {
+      console.log('Health check error:', err.message);
+      process.exit(1);
+    });
+    
+    req.on('timeout', () => {
+      console.log('Health check timeout');
+      req.destroy();
+      process.exit(1);
+    });
+    
+    req.end();
+  
+  startup.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Starting OpenShift MCP Server..."
+    echo "Configuration loaded:"
+    echo "  Server Name: ${MCP_SERVER_NAME:-openshift-mcp-server}"
+    echo "  Server Version: ${MCP_SERVER_VERSION:-1.0.0}"
+    echo "  Node Environment: ${NODE_ENV:-production}"
+    echo "  Kubernetes Namespace: ${KUBERNETES_NAMESPACE:-default}"
+    
+    # Check if we're running in Kubernetes
+    if [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+      echo "Running in Kubernetes cluster"
+      export KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST}
+      export KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT}
+    else
+      echo "Running outside Kubernetes cluster"
+    fi
+    
+    # Start the MCP server
+    exec node index.js
+  
+  prestart.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Pre-start checks..."
+    
+    # Check Node.js version
+    node --version
+    
+    # Check if package.json exists
+    if [ ! -f package.json ]; then
+      echo "Error: package.json not found"
+      exit 1
+    fi
+    
+    # Check if index.js exists
+    if [ ! -f index.js ]; then
+      echo "Error: index.js not found"
+      exit 1
+    fi
+    
+    # Check if required environment variables are set
+    if [ -z "${MCP_SERVER_NAME}" ]; then
+      echo "Warning: MCP_SERVER_NAME not set, using default"
+    fi
+    
+    echo "Pre-start checks completed successfully" 
