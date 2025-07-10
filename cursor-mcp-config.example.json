@@ -1,16 +1,16 @@
 {
   "mcpServers": {
-    "openshift-mcp-server": {
-      "command": "node",
-      "args": ["/path/to/openshift-mcp-server/index.js"],
+      "openshift_mcp_server": {
+    "command": "node",
+          "args": ["/path/to/openshift-mcp-server/index.js"],
       "env": {
         "KUBECONFIG": "/path/to/kubeconfig",
         "NODE_ENV": "production"
       }
     },
-    "openshift-mcp-server-ssh-key": {
-      "command": "/path/to/openshift-mcp-server/scripts/remote-mcp-wrapper.sh",
-      "args": [],
+    "openshift_mcp_server_ssh_key": {
+      "command": "node",
+      "args": ["/path/to/openshift-mcp-server/scripts/simple-remote-launcher.js"],
       "env": {
         "MCP_BASTION_HOST": "your-bastion-host.com",
         "MCP_BASTION_USER": "admin",
@@ -20,9 +20,9 @@
         "MCP_REMOTE_NODE_ENV": "production"
       }
     },
-    "openshift-mcp-server-password": {
-      "command": "/path/to/openshift-mcp-server/scripts/remote-mcp-wrapper.sh",
-      "args": [],
+    "openshift_mcp_server_password": {
+      "command": "node",
+      "args": ["/path/to/openshift-mcp-server/scripts/simple-remote-launcher.js"],
       "env": {
         "MCP_BASTION_HOST": "your-bastion-host.com",
         "MCP_BASTION_USER": "admin",
