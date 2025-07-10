@@ -13,7 +13,7 @@ set -e
 BASTION_HOST="${MCP_BASTION_HOST:-bastion.company.com}"
 BASTION_USER="${MCP_BASTION_USER:-admin}"
 BASTION_PASSWORD="${MCP_BASTION_PASSWORD:-}"
-REMOTE_PATH="${MCP_REMOTE_PATH:-/opt/cursor-kube-mcp-server}"
+REMOTE_PATH="${MCP_REMOTE_PATH:-/opt/openshift-mcp-server}"
 SSH_KEY="${MCP_SSH_KEY:-~/.ssh/id_rsa}"
 REMOTE_KUBECONFIG="${MCP_REMOTE_KUBECONFIG:-~/.kube/config}"
 
@@ -53,8 +53,8 @@ else
         exit 1
     fi
     
-    SSH_CMD="ssh -i '$SSH_KEY' -o StrictHostKeyChecking=no"
-    RSYNC_CMD="rsync -avz -e 'ssh -i $SSH_KEY -o StrictHostKeyChecking=no'"
+    SSH_CMD="ssh -i '$SSH_KEY' -o StrictHostKeyChecking=no -q"
+    RSYNC_CMD="rsync -avz -e \"ssh -i '$SSH_KEY' -o StrictHostKeyChecking=no -q\""
 fi
 
 # Test SSH connectivity
@@ -71,7 +71,7 @@ if [[ -n "$BASTION_PASSWORD" ]]; then
     fi
 else
     # Test with SSH key
-    if ! ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no "$BASTION_USER@$BASTION_HOST" "echo 'Connection successful'" >/dev/null 2>&1; then
+    if ! ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no -q "$BASTION_USER@$BASTION_HOST" "echo 'Connection successful'" >/dev/null 2>&1; then
         error "Cannot connect to bastion host: $BASTION_HOST"
         error "Please ensure:"
         error "1. SSH key is properly configured: $SSH_KEY"
@@ -166,4 +166,4 @@ log ""
 log "Next steps:"
 log "1. Ensure kubeconfig is properly configured on bastion host"
 log "2. Update your local Cursor configuration to use the remote wrapper"
-log "3. Test the connection with: ./scripts/remote-mcp-wrapper.sh" 
+log "3. Test the connection with: node scripts/simple-remote-launcher.js" 
