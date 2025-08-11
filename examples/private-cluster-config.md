@@ -1,4 +1,6 @@
-# Private OpenShift Cluster Configuration Examples
+# Private OpenShift Cluster Configuration for MCP Server
+
+This guide shows how to configure the OpenShift MCP Server to access private OpenShift clusters that are not directly accessible from your local development environment.
 
 ## 1. VPN Connection Setup
 
@@ -65,45 +67,37 @@ clusters:
   name: tunneled-openshift
 ```
 
-## 3. In-Cluster Deployment
+## 3. Bastion Host Deployment (Recommended)
 
-### Deploy MCP server as OpenShift pod:
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: openshift-mcp-server
-  namespace: monitoring
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: openshift-mcp-server
-  template:
-    metadata:
-      labels:
-        app: openshift-mcp-server
-    spec:
-      serviceAccountName: openshift-mcp-server
-      containers:
-      - name: mcp-server
-        image: openshift-mcp-server:latest
-        env:
-        - name: KUBERNETES_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        - name: NODE_ENV
-          value: "production"
-        ports:
-        - containerPort: 3000
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
+### Deploy MCP server on bastion host:
+```bash
+# Use the setup script to deploy to bastion host
+export MCP_BASTION_HOST=bastion.company.com
+export MCP_BASTION_USER=admin
+export MCP_SSH_KEY=~/.ssh/id_rsa
+export MCP_REMOTE_KUBECONFIG=/path/to/kubeconfig/on/bastion
+
+# Deploy using setup script
+scripts/setup-bastion.sh
+```
+
+### Configure Cursor IDE to use remote MCP server:
+```json
+{
+  "mcpServers": {
+    "openshift_mcp_server": {
+      "command": "ssh",
+      "args": [
+        "-i", "~/.ssh/id_rsa",
+        "admin@bastion.company.com",
+        "cd /opt/openshift-mcp-server && KUBECONFIG=/path/to/kubeconfig node index.js"
+      ],
+      "env": {
+        "NODE_ENV": "production"
+      }
+    }
+  }
+}
 ```
 
 ## 4. Proxy Configuration
@@ -118,31 +112,7 @@ export NO_PROXY=localhost,127.0.0.1,.internal,.company.com
 export NODE_TLS_REJECT_UNAUTHORIZED=0  # Only for development with self-signed certs
 ```
 
-## 5. Network Policy Considerations
-
-### Ensure MCP server can access cluster APIs:
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-mcp-server
-  namespace: monitoring
-spec:
-  podSelector:
-    matchLabels:
-      app: openshift-mcp-server
-  policyTypes:
-  - Egress
-  egress:
-  - to: []  # Allow all egress for cluster API access
-    ports:
-    - protocol: TCP
-      port: 6443  # Kubernetes API
-    - protocol: TCP
-      port: 8443  # OpenShift API
-```
-
-## 6. Testing Connectivity
+## 5. Testing Connectivity
 
 ### Test cluster connectivity:
 ```bash
@@ -162,6 +132,15 @@ oc get routes
 oc get projects
 ```
 
+### Test MCP server functionality:
+```bash
+# Test MCP server tools
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"check_cluster_health","arguments":{}}}' | node index.js
+
+# Test specific MCP tools
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_performance_metrics","arguments":{"timeRange":"1h"}}}' | node index.js
+```
+
 ### Troubleshooting commands:
 ```bash
 # Check current context
@@ -176,4 +155,24 @@ curl -k -H "Authorization: Bearer $(oc whoami -t)" \
 
 # Check DNS resolution
 nslookup api.openshift.internal
-``` 
+
+# Test SSH connectivity to bastion
+ssh -i ~/.ssh/id_rsa admin@bastion.company.com "echo 'SSH connection successful'"
+```
+
+## 6. Security Considerations
+
+### Best practices for private cluster access:
+- Use SSH key authentication instead of passwords
+- Limit SSH access to specific source IPs
+- Use jump hosts/bastion hosts for secure access
+- Rotate SSH keys and cluster tokens regularly
+- Enable SSH key forwarding carefully
+- Use VPN connections when available
+- Avoid storing sensitive credentials in configuration files
+
+### Network security:
+- Ensure firewall rules allow necessary connectivity
+- Use encrypted connections (TLS/SSL) for all cluster communication
+- Consider using service mesh for additional security layers
+- Monitor access logs on bastion hosts
