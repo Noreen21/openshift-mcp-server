@@ -93,7 +93,7 @@ For environments where SSH keys are not feasible:
    sudo yum install sshpass
    ```
 
-2. **Configure MCP environment variables**:
+2. (optional) **Configure MCP environment variables**:
    ```bash
    export MCP_BASTION_HOST="your-bastion-host.com"
    export MCP_BASTION_USER="your-username"
@@ -129,6 +129,22 @@ Run the setup script to prepare the bastion host:
 
 ```bash
 ./scripts/setup-bastion.sh
+```
+
+You may run the script using the following options:
+
+```bash
+Usage: ./scripts/setup-bastion.sh options
+    Options:
+        -H host         Bastion host
+        -U user         Bastion username
+        -P password     Bastion password
+        -p path         Path to mcp server on bastion
+        -s ssh_key      SSH keyfile
+        -k kubeconfig   Remote kubeconfig
+        -n              Don't actually run commands
+        -v              Verbose reporting
+        -q              No verbose reporting (default)
 ```
 
 This script will:
@@ -741,4 +757,4 @@ For issues and questions:
 - Check the troubleshooting section
 - Review Kubernetes/OpenShift documentation
 - Review [kube-burner-ocp documentation](https://kube-burner.github.io/kube-burner-ocp/)
-- File an issue in the repository 
+- File an issue in the repository
