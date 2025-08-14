@@ -1420,7 +1420,7 @@ class OpenShiftMCPServer {
         }
       }
       
-      const result = await promisifiedExec(kubectlCmd);
+      const result = await promisifiedExec(kubectlCmd, { maxBuffer: 1024 * 1024 * 10 }); // 10MB buffer for large deployment lists
       const deploymentsResponse = JSON.parse(result.stdout);
       
       if (!deploymentsResponse || !deploymentsResponse.items) {
