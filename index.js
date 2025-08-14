@@ -1395,11 +1395,34 @@ class OpenShiftMCPServer {
   async monitorDeployments(namespace) {
     try {
       const deploymentIssues = [];
-      const deploymentsResponse = namespace
-        ? await this.appsApi.listNamespacedDeployment(namespace)
-        : await this.appsApi.listDeploymentForAllNamespaces();
       
-      // Add null check to prevent undefined errors - fix for correct response structure
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      
+      let kubectlCmd;
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        
+        if (namespace) {
+          kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl get deployments -n ${namespace} -o json"`;
+        } else {
+          kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl get deployments --all-namespaces -o json"`;
+        }
+      } else {
+        if (namespace) {
+          kubectlCmd = `kubectl get deployments -n ${namespace} -o json`;
+        } else {
+          kubectlCmd = `kubectl get deployments --all-namespaces -o json`;
+        }
+      }
+      
+      const result = await promisifiedExec(kubectlCmd);
+      const deploymentsResponse = JSON.parse(result.stdout);
+      
       if (!deploymentsResponse || !deploymentsResponse.items) {
         throw new Error('Failed to retrieve deployments from cluster');
       }
@@ -1745,13 +1768,232 @@ class OpenShiftMCPServer {
     return recommendations;
   }
 
+  async checkKubeletStatus(hoursBack = 24, includeSystemErrors = false) {
+    try {
+      const promisifiedExec = promisify(exec);
+      
+      // Check if kubelet service exists and is running
+      let kubeletStatus = 'unknown';
+      let kubeletLogs = [];
+      let systemErrors = [];
+      
+      try {
+        // Get kubelet service status
+        const statusCmd = 'systemctl is-active kubelet 2>/dev/null || echo "inactive"';
+        const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+        
+        let fullStatusCmd;
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          fullStatusCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${statusCmd}"`;
+        } else {
+          fullStatusCmd = statusCmd;
+        }
+        
+        const statusResult = await promisifiedExec(fullStatusCmd);
+        kubeletStatus = statusResult.stdout.trim();
+        
+        // Get recent kubelet logs
+        const logsCmd = `journalctl -u kubelet --since '${hoursBack} hours ago' --lines=50 --no-pager`;
+        let fullLogsCmd;
+        
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          fullLogsCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${logsCmd}"`;
+        } else {
+          fullLogsCmd = logsCmd;
+        }
+        
+        const logsResult = await promisifiedExec(fullLogsCmd);
+        const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
+        
+        // Parse logs for errors and warnings
+        for (const line of logLines) {
+          if (line.toLowerCase().includes('error') || 
+              line.toLowerCase().includes('failed') ||
+              line.toLowerCase().includes('warn')) {
+            kubeletLogs.push({
+              timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
+              level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
+              message: line
+            });
+          }
+        }
+        
+        // If system errors are requested, check for broader system issues
+        if (includeSystemErrors) {
+          const systemCmd = `journalctl --since '${hoursBack} hours ago' --lines=20 --no-pager | grep -i 'systemd\\|kernel\\|oom'`;
+          let fullSystemCmd;
+          
+          if (useRemoteAccess) {
+            const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+            const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+            const sshUser = process.env.MCP_BASTION_USER || 'root';
+            fullSystemCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${systemCmd}"`;
+          } else {
+            fullSystemCmd = systemCmd;
+          }
+          
+          try {
+            const systemResult = await promisifiedExec(fullSystemCmd);
+            systemErrors = systemResult.stdout.split('\n').filter(line => line.trim());
+          } catch (systemError) {
+            // System errors are optional, don't fail if we can't get them
+            console.error('Could not retrieve system errors:', systemError.message);
+          }
+        }
+        
+      } catch (error) {
+        // If we can't check kubelet directly, indicate we couldn't access it
+        kubeletStatus = 'inaccessible';
+        kubeletLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'error',
+          message: `Cannot access kubelet service: ${error.message}`
+        });
+      }
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Kubelet Status Report:\n${JSON.stringify({
+              status: kubeletStatus,
+              logsAnalyzed: kubeletLogs.length,
+              systemErrors: includeSystemErrors ? systemErrors.length : 'not_requested',
+              recentIssues: kubeletLogs.slice(0, 10),
+              systemIssues: includeSystemErrors ? systemErrors.slice(0, 5) : []
+            }, null, 2)}`
+          }
+        ]
+      };
+      
+    } catch (error) {
+      throw new Error(`Failed to check kubelet status: ${error.message}`);
+    }
+  }
+
+  async checkCrioStatus(hoursBack = 24, includeContainerErrors = true) {
+    try {
+      const promisifiedExec = promisify(exec);
+      
+      // Check CRI-O service status and logs
+      let crioStatus = 'unknown';
+      let crioLogs = [];
+      let containerErrors = [];
+      
+      try {
+        // Get CRI-O service status
+        const statusCmd = 'systemctl is-active crio 2>/dev/null || echo "inactive"';
+        const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+        
+        let fullStatusCmd;
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          fullStatusCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${statusCmd}"`;
+        } else {
+          fullStatusCmd = statusCmd;
+        }
+        
+        const statusResult = await promisifiedExec(fullStatusCmd);
+        crioStatus = statusResult.stdout.trim();
+        
+        // Get recent CRI-O logs
+        const logsCmd = `journalctl -u crio --since '${hoursBack} hours ago' --lines=50 --no-pager`;
+        let fullLogsCmd;
+        
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          fullLogsCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${logsCmd}"`;
+        } else {
+          fullLogsCmd = logsCmd;
+        }
+        
+        const logsResult = await promisifiedExec(fullLogsCmd);
+        const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
+        
+        // Parse logs for CRI-O specific issues
+        for (const line of logLines) {
+          if (line.toLowerCase().includes('error') || 
+              line.toLowerCase().includes('failed') ||
+              line.toLowerCase().includes('warn')) {
+            crioLogs.push({
+              timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
+              level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
+              message: line
+            });
+          }
+        }
+        
+        // If container errors are requested, check for container-specific issues
+        if (includeContainerErrors) {
+          const containerCmd = `journalctl --since '${hoursBack} hours ago' --lines=30 --no-pager | grep -i 'container\\|cri-o\\|runc'`;
+          let fullContainerCmd;
+          
+          if (useRemoteAccess) {
+            const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+            const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+            const sshUser = process.env.MCP_BASTION_USER || 'root';
+            fullContainerCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${containerCmd}"`;
+          } else {
+            fullContainerCmd = containerCmd;
+          }
+          
+          try {
+            const containerResult = await promisifiedExec(fullContainerCmd);
+            containerErrors = containerResult.stdout.split('\n').filter(line => line.trim());
+          } catch (containerError) {
+            // Container errors are optional, don't fail if we can't get them
+            console.error('Could not retrieve container errors:', containerError.message);
+          }
+        }
+        
+      } catch (error) {
+        // If we can't check CRI-O directly, indicate we couldn't access it
+        crioStatus = 'inaccessible';
+        crioLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'error',
+          message: `Cannot access CRI-O service: ${error.message}`
+        });
+      }
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `CRI-O Status Report:\n${JSON.stringify({
+              status: crioStatus,
+              logsAnalyzed: crioLogs.length,
+              containerErrors: includeContainerErrors ? containerErrors.length : 'not_requested',
+              recentIssues: crioLogs.slice(0, 10),
+              containerIssues: includeContainerErrors ? containerErrors.slice(0, 5) : []
+            }, null, 2)}`
+          }
+        ]
+      };
+      
+    } catch (error) {
+      throw new Error(`Failed to check CRI-O status: ${error.message}`);
+    }
+  }
+
   // ======================
   // DEPLOYMENT TOOLS
   // ======================
 
   async createDeployment(args) {
     try {
-      const { name, namespace = 'default', image, replicas = 1, resources = {}, ports = [] } = args;
+      const { name, namespace: inputNamespace, image, replicas = 1, resources = {}, ports = [] } = args;
+      const namespace = inputNamespace || 'default';
       
       const deployment = {
         apiVersion: 'apps/v1',
@@ -1815,7 +2057,75 @@ class OpenShiftMCPServer {
         }
       }
 
-      const result = await this.appsApi.createNamespacedDeployment(namespace, deployment);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const deploymentYaml = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    app: ${name}
+    managed-by: openshift-mcp-server
+spec:
+  replicas: ${replicas}
+  selector:
+    matchLabels:
+      app: ${name}
+  template:
+    metadata:
+      labels:
+        app: ${name}
+    spec:
+      containers:
+      - name: ${name}
+        image: ${image}
+        ports:
+${ports.map(port => `        - containerPort: ${port.containerPort}
+          protocol: ${port.protocol || 'TCP'}`).join('\n')}
+        resources:
+          requests:
+            cpu: "${resources.cpuRequest || '100m'}"
+            memory: "${resources.memoryRequest || '128Mi'}"
+          limits:
+            cpu: "${resources.cpuLimit || resources.cpuRequest || '100m'}"
+            memory: "${resources.memoryLimit || resources.memoryRequest || '128Mi'}"
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${deploymentYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${deploymentYaml}' | kubectl apply -f -`;
+      }
+
+      const kubectlResult = await promisifiedExec(kubectlCmd);
+      
+      // Mock the result format expected by the rest of the function
+      const result = {
+        metadata: {
+          name: name,
+          namespace: namespace
+        },
+        spec: {
+          replicas: replicas,
+          template: {
+            spec: {
+              containers: [
+                {
+                  image: image
+                }
+              ]
+            }
+          }
+        }
+      };
       
       return {
         content: [
@@ -1839,7 +2149,8 @@ class OpenShiftMCPServer {
 
   async deployDatabase(args) {
     try {
-      const { type, name, namespace = 'default', storageSize = '10Gi', resources = {} } = args;
+      const { type, name, namespace: inputNamespace, storageSize = '10Gi', resources = {} } = args;
+      const namespace = inputNamespace || 'default';
       
       const dbConfigs = {
         postgresql: {
@@ -1908,7 +2219,35 @@ class OpenShiftMCPServer {
         }
       };
 
-      await this.k8sApi.createNamespacedPersistentVolumeClaim(namespace, pvc);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const pvcYaml = `apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${name}-storage
+  namespace: ${namespace}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: ${storageSize}
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlPvcCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlPvcCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${pvcYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlPvcCmd = `echo '${pvcYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlPvcCmd);
 
       // Create Deployment
       const deployment = {
@@ -1981,7 +2320,77 @@ class OpenShiftMCPServer {
         }
       };
 
-      const deploymentResult = await this.appsApi.createNamespacedDeployment(namespace, deployment);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug  
+      const deploymentYaml = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    app: ${name}
+    type: database
+    managed-by: openshift-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${name}
+  template:
+    metadata:
+      labels:
+        app: ${name}
+        type: database
+    spec:
+      containers:
+      - name: ${type}
+        image: ${type === 'postgresql' ? 'postgres:latest' : type === 'mysql' ? 'mysql:latest' : type === 'mongodb' ? 'mongo:latest' : 'redis:latest'}
+        ports:
+        - containerPort: ${type === 'postgresql' ? 5432 : type === 'mysql' ? 3306 : type === 'mongodb' ? 27017 : 6379}
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "${resources.cpuRequest || '250m'}"
+            memory: "${resources.memoryRequest || '512Mi'}"
+          limits:
+            cpu: "${resources.cpuLimit || resources.cpuRequest || '1000m'}"
+            memory: "${resources.memoryLimit || resources.memoryRequest || '1Gi'}"
+        env:
+        - name: POSTGRES_DB
+          value: "${name}"
+        - name: POSTGRES_USER  
+          value: "admin"
+        - name: POSTGRES_PASSWORD
+          value: "password"
+        volumeMounts:
+        - name: ${name}-storage
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: ${name}-storage
+        persistentVolumeClaim:
+          claimName: ${name}-pvc
+`;
+
+      let kubectlServiceCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${deploymentYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${deploymentYaml}' | kubectl apply -f -`;
+      }
+
+      const kubectlResult = await promisifiedExec(kubectlCmd);
+      
+      // Mock the result format expected by the rest of the function
+      const deploymentResult = {
+        metadata: {
+          name: deployment.metadata.name,
+          namespace: namespace
+        }
+      };
 
       // Create Service
       const service = {
@@ -2005,7 +2414,36 @@ class OpenShiftMCPServer {
         }
       };
 
-      await this.k8sApi.createNamespacedService(namespace, service);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const serviceYaml = `apiVersion: v1
+kind: Service
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    app: ${name}
+    db-type: ${type}
+    managed-by: openshift-mcp-server
+spec:
+  selector:
+    app: ${name}
+  ports:
+  - port: ${config.port}
+    targetPort: ${config.port}
+    protocol: TCP
+`;
+
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${serviceYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${serviceYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlCmd);
 
       return {
         content: [
@@ -2033,12 +2471,13 @@ class OpenShiftMCPServer {
     try {
       const { 
         targetDeployment, 
-        namespace = 'default', 
+        namespace: inputNamespace, 
         minReplicas = 1, 
         maxReplicas = 10, 
         cpuTarget = 70, 
         memoryTarget = 80 
       } = args;
+      const namespace = inputNamespace || 'default';
 
       // Verify deployment exists
       try {
@@ -2093,10 +2532,57 @@ class OpenShiftMCPServer {
         }
       };
 
-      // Note: Need to check if autoscaling API is available
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const hpaYaml = `apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ${targetDeployment}-hpa
+  namespace: ${namespace}
+  labels:
+    managed-by: openshift-mcp-server
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ${targetDeployment}
+  minReplicas: ${minReplicas}
+  maxReplicas: ${maxReplicas}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: ${cpuTarget}
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: ${memoryTarget}
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${hpaYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${hpaYaml}' | kubectl apply -f -`;
+      }
+
       try {
-        const autoscalingApi = this.kubeConfig.makeApiClient(k8s.AutoscalingV2Api);
-        const result = await autoscalingApi.createNamespacedHorizontalPodAutoscaler(namespace, hpa);
+        const kubectlResult = await promisifiedExec(kubectlCmd);
+        
+        // Mock the result format expected by the rest of the function
+        const result = {
+          metadata: { name: `${targetDeployment}-hpa`, namespace: namespace }
+        };
         
         return {
           content: [
@@ -2126,7 +2612,8 @@ class OpenShiftMCPServer {
 
   async createService(args) {
     try {
-      const { name, namespace = 'default', selector, ports, type = 'ClusterIP' } = args;
+      const { name, namespace: inputNamespace, selector, ports, type = 'ClusterIP' } = args;
+      const namespace = inputNamespace || 'default';
 
       const service = {
         apiVersion: 'v1',
@@ -2161,7 +2648,45 @@ class OpenShiftMCPServer {
         }
       }
 
-      const result = await this.k8sApi.createNamespacedService(namespace, service);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const serviceYaml = `apiVersion: v1
+kind: Service
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    managed-by: openshift-mcp-server
+spec:
+  selector:
+${Object.entries(selector).map(([k, v]) => `    ${k}: ${v}`).join('\n')}
+  ports:
+${ports.map(p => `  - port: ${p.port}
+    targetPort: ${p.targetPort}
+    protocol: ${p.protocol || 'TCP'}`).join('\n')}
+  type: ${type}
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${serviceYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${serviceYaml}' | kubectl apply -f -`;
+      }
+
+      const kubectlResult = await promisifiedExec(kubectlCmd);
+      
+      // Mock the result format expected by the rest of the function
+      const result = {
+        metadata: { name: name, namespace: namespace },
+        spec: { type: type, ports: ports, selector: selector }
+      };
       
       return {
         content: [
@@ -2186,7 +2711,8 @@ class OpenShiftMCPServer {
 
   async createNetworkPolicy(args) {
     try {
-      const { name, namespace = 'default', podSelector, ingress = [], egress = [] } = args;
+      const { name, namespace: inputNamespace, podSelector, ingress = [], egress = [] } = args;
+      const namespace = inputNamespace || 'default';
 
       const networkPolicy = {
         apiVersion: 'networking.k8s.io/v1',
@@ -2233,8 +2759,49 @@ class OpenShiftMCPServer {
         }
       }
 
-      const networkingApi = this.kubeConfig.makeApiClient(k8s.NetworkingV1Api);
-      const result = await networkingApi.createNamespacedNetworkPolicy(namespace, networkPolicy);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const networkPolicyYaml = `apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    managed-by: openshift-mcp-server
+spec:
+  podSelector:
+${Object.entries(podSelector).map(([k, v]) => `    ${k}: ${v}`).join('\n')}
+  policyTypes:
+${networkPolicy.spec.policyTypes.map(type => `  - ${type}`).join('\n')}
+${networkPolicy.spec.ingress ? `  ingress:
+${JSON.stringify(networkPolicy.spec.ingress, null, 2).split('\n').map(line => `  ${line}`).join('\n')}` : ''}
+${networkPolicy.spec.egress ? `  egress:
+${JSON.stringify(networkPolicy.spec.egress, null, 2).split('\n').map(line => `  ${line}`).join('\n')}` : ''}
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${networkPolicyYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${networkPolicyYaml}' | kubectl apply -f -`;
+      }
+
+      const kubectlResult = await promisifiedExec(kubectlCmd);
+      
+      // Mock the result format expected by the rest of the function
+      const result = {
+        metadata: { name: name, namespace: namespace },
+        spec: { 
+          podSelector: podSelector, 
+          policyTypes: networkPolicy.spec.policyTypes 
+        }
+      };
       
       return {
         content: [
@@ -2567,9 +3134,10 @@ spec:
       
       // Create test namespace
       try {
-        await this.k8sApi.createNamespace({
+        const namespaceObject = {
           metadata: { name: testNamespace }
-        });
+        };
+        await this.k8sApi.createNamespace(namespaceObject);
       } catch (error) {
         if (error.response?.statusCode !== 409) {
           throw error;
@@ -2596,7 +3164,36 @@ spec:
         }
       };
 
-      await this.k8sApi.createNamespacedPersistentVolumeClaim(testNamespace, pvc);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const pvcYaml = `apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvcName}
+  namespace: ${testNamespace}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: ${volumeSize}
+${storageClass ? `  storageClassName: ${storageClass}` : ''}
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${pvcYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${pvcYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlCmd);
 
       // Create FIO test job
       const job = {
@@ -2638,8 +3235,45 @@ spec:
         }
       };
 
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const jobYaml = `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fio-${testType}-${Date.now()}
+  namespace: ${testNamespace}
+spec:
+  template:
+    spec:
+      containers:
+      - name: fio
+        image: quay.io/openshift/origin-tests:latest
+        command: ["fio"]
+        args: ["--name=test", "--rw=${testType}", "--bs=${blockSize}", "--runtime=${duration}", "--ioengine=libaio", "--direct=1", "--filename=/data/testfile", "--size=1G"]
+        volumeMounts:
+        - name: test-data
+          mountPath: /data
+      volumes:
+      - name: test-data
+        persistentVolumeClaim:
+          claimName: ${pvcName}
+      restartPolicy: Never
+  backoffLimit: 0
+`;
+
+      let kubectlJobCmd;
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlJobCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${jobYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlJobCmd = `echo '${jobYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlJobCmd);
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
-      const jobResult = await batchApi.createNamespacedJob(testNamespace, job);
+      const jobResult = { metadata: { name: `fio-${testType}-${Date.now()}` } };
 
       // Wait for job completion (simplified - in production, use proper polling)
       await new Promise(resolve => setTimeout(resolve, parseInt(duration) * 1000 + 30000));
@@ -2716,14 +3350,26 @@ spec:
 
       const testNamespace = 'network-test';
       
-      // Create test namespace
+      // WORKAROUND: Use kubectl to create namespace due to client library bug
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      
       try {
-        await this.k8sApi.createNamespace({
-          metadata: { name: testNamespace }
-        });
+        let kubectlNsCmd;
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+          kubectlNsCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl create namespace ${testNamespace} --dry-run=client -o yaml | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+        } else {
+          kubectlNsCmd = `kubectl create namespace ${testNamespace} --dry-run=client -o yaml | kubectl apply -f -`;
+        }
+        await promisifiedExec(kubectlNsCmd);
       } catch (error) {
-        if (error.response?.statusCode !== 409) {
-          throw error;
+        // Ignore if namespace already exists
+        if (!error.message.includes('already exists')) {
+          console.warn(`Namespace creation warning: ${error.message}`);
         }
       }
 
@@ -2754,14 +3400,58 @@ spec:
         }
       };
 
-      await this.k8sApi.createNamespacedPod(testNamespace, serverPod);
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const podYaml = `apiVersion: v1
+kind: Pod
+metadata:
+  name: iperf3-server
+  namespace: ${testNamespace}
+  labels:
+    app: iperf3-server
+spec:
+  containers:
+  - name: iperf3
+    image: networkstatic/iperf3
+    command: ["iperf3", "-s"]
+    ports:
+    - containerPort: 5201
+`;
+
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${podYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${podYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlCmd);
 
       // Wait for server to be ready
       await new Promise(resolve => setTimeout(resolve, 10000));
 
-      // Get server IP
-      const serverPodInfo = await this.k8sApi.readNamespacedPod('iperf3-server', testNamespace);
-      const serverIP = serverPodInfo.status?.podIP;
+      // WORKAROUND: Get server IP using kubectl due to client library bug
+      let serverIP;
+      try {
+        let getPodCmd;
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+          getPodCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl get pod iperf3-server -n ${testNamespace} -o jsonpath='{.status.podIP}'"`;
+        } else {
+          getPodCmd = `kubectl get pod iperf3-server -n ${testNamespace} -o jsonpath='{.status.podIP}'`;
+        }
+        const result = await promisifiedExec(getPodCmd);
+        serverIP = result.stdout.trim();
+      } catch (error) {
+        throw new Error(`Could not get server pod IP: ${error.message}`);
+      }
 
       if (!serverIP) {
         throw new Error('Server pod IP not available');
@@ -2770,14 +3460,14 @@ spec:
       // Create iperf3 client job
       const clientArgs = [
         'iperf3',
-        '-c', serverIP,
-        '-t', duration.replace('s', ''),
+        '-c', serverIP.toString(),
+        '-t', duration.replace('s', '').toString(),
         '-P', parallel.toString(),
         '--json'
       ];
 
       if (protocol === 'udp') {
-        clientArgs.push('-u', '-b', bandwidth);
+        clientArgs.push('-u', '-b', bandwidth.toString());
       }
 
       const clientJob = {
@@ -2804,8 +3494,40 @@ spec:
         }
       };
 
-      const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
-      const jobResult = await batchApi.createNamespacedJob(testNamespace, clientJob);
+      // WORKAROUND: Use kubectl run instead of kubectl apply to avoid YAML parsing issues
+      const jobName = `iperf3-client-${Date.now()}`;
+      const testCommand = `iperf3 -c ${serverIP} -t ${duration.replace('s', '')} -P ${parallel} --json`;
+      
+      const jobYaml = `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${jobName}
+  namespace: ${testNamespace}
+spec:
+  template:
+    spec:
+      containers:
+      - name: iperf3
+        image: networkstatic/iperf3
+        command: ["/bin/sh"]
+        args: ["-c", "${testCommand}"]
+      restartPolicy: Never
+  backoffLimit: 0
+`;
+
+      let kubectlJobCmd;
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlJobCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${jobYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlJobCmd = `echo '${jobYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlJobCmd);
+      const jobResult = { metadata: { name: jobName } };
 
       // Wait for test completion
       await new Promise(resolve => setTimeout(resolve, parseInt(duration) * 1000 + 10000));
@@ -2823,9 +3545,25 @@ spec:
         results = 'Failed to retrieve test results';
       }
 
-      // Cleanup
-      await batchApi.deleteNamespacedJob(jobResult.metadata.name, testNamespace);
-      await this.k8sApi.deleteNamespacedPod('iperf3-server', testNamespace);
+      // WORKAROUND: Cleanup using kubectl due to client library bug
+      try {
+        let cleanupJobCmd, cleanupPodCmd;
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+          cleanupJobCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl delete job ${jobResult.metadata.name} -n ${testNamespace} --ignore-not-found"`;
+          cleanupPodCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl delete pod iperf3-server -n ${testNamespace} --ignore-not-found"`;
+        } else {
+          cleanupJobCmd = `kubectl delete job ${jobResult.metadata.name} -n ${testNamespace} --ignore-not-found`;
+          cleanupPodCmd = `kubectl delete pod iperf3-server -n ${testNamespace} --ignore-not-found`;
+        }
+        await promisifiedExec(cleanupJobCmd);
+        await promisifiedExec(cleanupPodCmd);
+      } catch (error) {
+        console.warn(`Cleanup warning: ${error.message}`);
+      }
 
       return {
         content: [
@@ -2863,9 +3601,10 @@ spec:
       
       // Create test namespace
       try {
-        await this.k8sApi.createNamespace({
+        const namespaceObject = {
           metadata: { name: testNamespace }
-        });
+        };
+        await this.k8sApi.createNamespace(namespaceObject);
       } catch (error) {
         if (error.response?.statusCode !== 409) {
           throw error;
@@ -2910,8 +3649,50 @@ spec:
         }
       };
 
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const jobYaml = `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stress-test-${testType}-${Date.now()}
+  namespace: ${testNamespace}
+spec:
+  template:
+    spec:
+      containers:
+      - name: stress
+        image: polinux/stress
+        command: ["stress"]
+        args: ${JSON.stringify(stressArgs)}
+        resources:
+          requests:
+            cpu: ${cpuCores}000m
+            memory: ${memorySize}
+          limits:
+            cpu: ${cpuCores}000m
+            memory: ${memorySize}
+      restartPolicy: Never
+${Object.keys(nodeSelector).length > 0 ? `      nodeSelector:
+${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}` : ''}
+  backoffLimit: 0
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${jobYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${jobYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlCmd);
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
-      const jobResult = await batchApi.createNamespacedJob(testNamespace, job);
+      const jobResult = { metadata: { name: `stress-test-${testType}-${Date.now()}` } };
 
       // Wait for test completion
       const durationSeconds = this.parseDuration(duration);
@@ -3012,9 +3793,10 @@ spec:
       
       // Create test namespace
       try {
-        await this.k8sApi.createNamespace({
+        const namespaceObject = {
           metadata: { name: testNamespace }
-        });
+        };
+        await this.k8sApi.createNamespace(namespaceObject);
       } catch (error) {
         if (error.response?.statusCode !== 409) {
           throw error;
@@ -3078,8 +3860,40 @@ spec:
         }
       };
 
+      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      const jobYaml = `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-benchmark-${dbType}-${Date.now()}
+  namespace: ${testNamespace}
+spec:
+  template:
+    spec:
+      containers:
+      - name: benchmark
+        image: ${dbType === 'postgresql' ? 'postgres:13' : 'perconalab/sysbench'}
+        command: ${JSON.stringify(benchmarkCommand)}
+      restartPolicy: Never
+  backoffLimit: 0
+`;
+
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let kubectlCmd;
+      
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${jobYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlCmd = `echo '${jobYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlCmd);
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
-      const jobResult = await batchApi.createNamespacedJob(testNamespace, job);
+      const jobResult = { metadata: { name: `db-benchmark-${dbType}-${Date.now()}` } };
 
       // Wait for test completion
       await new Promise(resolve => setTimeout(resolve, durationSeconds * 1000 + 30000));
