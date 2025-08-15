@@ -689,13 +689,13 @@ class OpenShiftMCPServer {
             return await this.monitorDeployments(args?.namespace);
           
           case "check_kubelet_status":
-            return await this.checkKubeletStatus(args?.hoursBack, args?.includeSystemErrors);
+            return await this.checkKubeletStatus(args?.hoursBack ?? 24, args?.includeSystemErrors || false);
           
           case "check_crio_status":
-            return await this.checkCrioStatus(args?.hoursBack, args?.includeContainerErrors);
+            return await this.checkCrioStatus(args?.hoursBack ?? 24, args?.includeContainerErrors !== false);
           
           case "analyze_journalctl_pod_errors":
-            return await this.analyzeJournalctlPodErrors(args?.pod, args?.hoursBack, args?.service, args?.errorTypes);
+            return await this.analyzeJournalctlPodErrors(args?.pod, args?.hoursBack || 24, args?.service, args?.errorTypes || ['error', 'fail', 'warn']);
           
           // Deployment Tools
           case "create_deployment":
@@ -737,7 +737,7 @@ class OpenShiftMCPServer {
           content: [
             {
               type: "text",
-              text: `Error executing ${name}: ${this.sanitizeErrorMessage(error.message)}`
+              text: `Error executing ${name}: ${error.message + " [DEBUG: Raw error]"}`
             }
           ],
           isError: true
@@ -1485,6 +1485,9 @@ class OpenShiftMCPServer {
 
   async analyzeJournalctlPodErrors(pod, hoursBack = 24, service, errorTypes = ['error', 'fail', 'warn']) {
     try {
+      // Ensure hoursBack has a default value to prevent undefined errors
+      hoursBack = hoursBack || 24;
+      errorTypes = errorTypes || ['error', 'fail', 'warn'];
       // Check if we have access to the node via oc debug
       const nodes = await this.k8sApi.listNode();
       if (!nodes || !nodes.items || nodes.items.length === 0) {
@@ -1512,27 +1515,33 @@ class OpenShiftMCPServer {
       
       journalCommand += ' | tail -50'; // Limit output
       
-      // Determine if we need to use remote access
-      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.SSH_HOST;
+      // Determine if we need remote access (SSH to bastion) or direct access
+      const needsRemoteAccess = process.env.MCP_BASTION_HOST && 
+                                 process.env.MCP_BASTION_HOST !== 'localhost' &&
+                                 !process.env.RUNNING_ON_BASTION;
       let fullCommand;
       
-      if (useRemoteAccess) {
-        // Use SSH to access bastion host and then oc debug
-        const sshHost = process.env.SSH_HOST || 'localhost';
-        const sshKey = process.env.SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+      if (needsRemoteAccess) {
+        // Remote access: SSH to bastion host, then oc debug
+        const sshHost = process.env.MCP_BASTION_HOST;
+        const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
         const kubeconfigPath = process.env.MCP_REMOTE_KUBECONFIG || process.env.KUBECONFIG;
         
-        fullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@${sshHost} "KUBECONFIG=${kubeconfigPath} oc debug node/${nodeName} -- chroot /host ${journalCommand}"`;
+        fullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 60s oc debug node/${nodeName} -- chroot /host bash -c \\"${journalCommand.replace(/"/g, '\\"')}\\""`; 
       } else {
-        // Direct access
-        fullCommand = `oc debug node/${nodeName} -- chroot /host ${journalCommand}`;
+        // Direct access: MCP server has direct cluster access OR running on bastion
+        const kubeconfigPath = process.env.MCP_REMOTE_KUBECONFIG || process.env.KUBECONFIG || '/root/.kube/config';
+        fullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 60s oc debug node/${nodeName} -- chroot /host bash -c "${journalCommand}"`;
       }
+
       
       console.error(`Executing journalctl analysis: ${fullCommand}`);
       
       // Execute the command
       const result = await promisifiedExec(fullCommand, { 
-        timeout: 30000, // 30 second timeout
+        timeout: 90000, // 90 second timeout for oc debug node access (takes time to create debug pod)
+        maxBuffer: 1024 * 1024 * 5, // 5MB buffer for large log outputs,
         env: {
           ...process.env,
           KUBECONFIG: process.env.MCP_REMOTE_KUBECONFIG || process.env.KUBECONFIG
@@ -1559,7 +1568,7 @@ class OpenShiftMCPServer {
         content: [
           {
             type: "text",
-            text: `Error analyzing journalctl logs: ${this.sanitizeErrorMessage(error.message)}`
+            text: `Error analyzing journalctl logs: ${error.message + " [DEBUG: Raw error]"}`
           }
         ],
         isError: true
@@ -1772,89 +1781,131 @@ class OpenShiftMCPServer {
     try {
       const promisifiedExec = promisify(exec);
       
-      // Check if kubelet service exists and is running
-      let kubeletStatus = 'unknown';
-      let kubeletLogs = [];
-      let systemErrors = [];
+      // Get all cluster nodes first
+      const kubeconfigPath = process.env.MCP_REMOTE_KUBECONFIG || process.env.KUBECONFIG || '/root/.kube/config';
+      const needsRemoteAccess = process.env.MCP_BASTION_HOST && 
+                                 process.env.MCP_BASTION_HOST !== 'localhost' &&
+                                 !process.env.RUNNING_ON_BASTION;
       
-      try {
-        // Get kubelet service status
-        const statusCmd = 'systemctl is-active kubelet 2>/dev/null || echo "inactive"';
-        const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let getNodesCmd;
+      if (needsRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST;
+        const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        getNodesCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} kubectl get nodes -o json"`;
+      } else {
+        getNodesCmd = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} kubectl get nodes -o json`;
+      }
+      
+      const nodesResult = await promisifiedExec(getNodesCmd, { maxBuffer: 1024 * 1024 * 5, timeout: 30000 });
+      const nodes = JSON.parse(nodesResult.stdout);
+      
+      if (!nodes.items || nodes.items.length === 0) {
+        throw new Error('No nodes found in cluster');
+      }
+      
+      let allKubeletStatus = {};
+      let allKubeletLogs = [];
+      let allSystemErrors = [];
+      
+      // Check kubelet on each node
+      for (const node of nodes.items) {
+        const nodeName = node.metadata.name;
         
-        let fullStatusCmd;
-        if (useRemoteAccess) {
-          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-          const sshUser = process.env.MCP_BASTION_USER || 'root';
-          fullStatusCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${statusCmd}"`;
-        } else {
-          fullStatusCmd = statusCmd;
-        }
-        
-        const statusResult = await promisifiedExec(fullStatusCmd);
-        kubeletStatus = statusResult.stdout.trim();
-        
-        // Get recent kubelet logs
-        const logsCmd = `journalctl -u kubelet --since '${hoursBack} hours ago' --lines=50 --no-pager`;
-        let fullLogsCmd;
-        
-        if (useRemoteAccess) {
-          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-          const sshUser = process.env.MCP_BASTION_USER || 'root';
-          fullLogsCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${logsCmd}"`;
-        } else {
-          fullLogsCmd = logsCmd;
-        }
-        
-        const logsResult = await promisifiedExec(fullLogsCmd);
-        const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
-        
-        // Parse logs for errors and warnings
-        for (const line of logLines) {
-          if (line.toLowerCase().includes('error') || 
-              line.toLowerCase().includes('failed') ||
-              line.toLowerCase().includes('warn')) {
-            kubeletLogs.push({
-              timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
-              level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
-              message: line
-            });
-          }
-        }
-        
-        // If system errors are requested, check for broader system issues
-        if (includeSystemErrors) {
-          const systemCmd = `journalctl --since '${hoursBack} hours ago' --lines=20 --no-pager | grep -i 'systemd\\|kernel\\|oom'`;
-          let fullSystemCmd;
+        try {
+          // Check kubelet status on this node
+          const statusCommand = 'systemctl is-active kubelet.service 2>/dev/null || echo "inactive"';
+          let statusFullCommand;
           
-          if (useRemoteAccess) {
-            const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-            const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          if (needsRemoteAccess) {
+            const sshHost = process.env.MCP_BASTION_HOST;
+            const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
             const sshUser = process.env.MCP_BASTION_USER || 'root';
-            fullSystemCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${systemCmd}"`;
+            statusFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${statusCommand.replace(/"/g, '\\"')}\\""`; 
           } else {
-            fullSystemCmd = systemCmd;
+            statusFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${statusCommand}"`;
           }
           
-          try {
-            const systemResult = await promisifiedExec(fullSystemCmd);
-            systemErrors = systemResult.stdout.split('\n').filter(line => line.trim());
-          } catch (systemError) {
-            // System errors are optional, don't fail if we can't get them
-            console.error('Could not retrieve system errors:', systemError.message);
+          const statusResult = await promisifiedExec(statusFullCommand, { 
+            maxBuffer: 1024 * 1024 * 5, 
+            timeout: 120000  // 2 minutes for oc debug pod creation
+          });
+          allKubeletStatus[nodeName] = statusResult.stdout.trim();
+          
+          // Get kubelet logs from this node
+          const logsCommand = `journalctl -u kubelet.service --since="-${hoursBack}h" --lines=50 --no-pager`;
+          let logsFullCommand;
+          
+          if (needsRemoteAccess) {
+            const sshHost = process.env.MCP_BASTION_HOST;
+            const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+            const sshUser = process.env.MCP_BASTION_USER || 'root';
+            logsFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${logsCommand.replace(/"/g, '\\"')}\\""`; 
+          } else {
+            logsFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${logsCommand}"`;
           }
+          
+          const logsResult = await promisifiedExec(logsFullCommand, { 
+            maxBuffer: 1024 * 1024 * 5, 
+            timeout: 120000  // 2 minutes for oc debug pod creation
+          });
+          
+          const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
+          
+          // Parse logs for errors and warnings
+          for (const line of logLines) {
+            if (line.toLowerCase().includes('error') || 
+                line.toLowerCase().includes('failed') ||
+                line.toLowerCase().includes('warn')) {
+              allKubeletLogs.push({
+                node: nodeName,
+                timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
+                level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
+                message: line
+              });
+            }
+          }
+          
+          // If system errors are requested, check for broader system issues on this node
+          if (includeSystemErrors) {
+            const systemCommand = `journalctl --since="-${hoursBack}h" --lines=20 --no-pager | grep -i 'systemd\\|kernel\\|oom'`;
+            let systemFullCommand;
+            
+            if (needsRemoteAccess) {
+              const sshHost = process.env.MCP_BASTION_HOST;
+              const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+              const sshUser = process.env.MCP_BASTION_USER || 'root';
+              systemFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${systemCommand.replace(/"/g, '\\"')}\\""`; 
+            } else {
+              systemFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${systemCommand}"`;
+            }
+            
+            try {
+              const systemResult = await promisifiedExec(systemFullCommand, { 
+                maxBuffer: 1024 * 1024 * 5, 
+                timeout: 120000
+              });
+              const systemLines = systemResult.stdout.split('\n').filter(line => line.trim());
+              for (const line of systemLines) {
+                allSystemErrors.push({
+                  node: nodeName,
+                  message: line
+                });
+              }
+            } catch (systemError) {
+              console.error(`Could not retrieve system errors from node ${nodeName}:`, systemError.message);
+            }
+          }
+          
+        } catch (nodeError) {
+          allKubeletStatus[nodeName] = 'inaccessible';
+          allKubeletLogs.push({
+            node: nodeName,
+            timestamp: new Date().toISOString(),
+            level: 'error',
+            message: `Cannot access kubelet service on node ${nodeName}: ${nodeError.message}`
+          });
         }
-        
-      } catch (error) {
-        // If we can't check kubelet directly, indicate we couldn't access it
-        kubeletStatus = 'inaccessible';
-        kubeletLogs.push({
-          timestamp: new Date().toISOString(),
-          level: 'error',
-          message: `Cannot access kubelet service: ${error.message}`
-        });
       }
       
       return {
@@ -1862,11 +1913,12 @@ class OpenShiftMCPServer {
           {
             type: "text",
             text: `Kubelet Status Report:\n${JSON.stringify({
-              status: kubeletStatus,
-              logsAnalyzed: kubeletLogs.length,
-              systemErrors: includeSystemErrors ? systemErrors.length : 'not_requested',
-              recentIssues: kubeletLogs.slice(0, 10),
-              systemIssues: includeSystemErrors ? systemErrors.slice(0, 5) : []
+              nodesChecked: nodes.items.length,
+              status: allKubeletStatus,
+              logsAnalyzed: allKubeletLogs.length,
+              systemErrors: includeSystemErrors ? allSystemErrors.length : 'not_requested',
+              recentIssues: allKubeletLogs.slice(0, 10),
+              systemIssues: includeSystemErrors ? allSystemErrors.slice(0, 5) : []
             }, null, 2)}`
           }
         ]
@@ -1881,89 +1933,133 @@ class OpenShiftMCPServer {
     try {
       const promisifiedExec = promisify(exec);
       
-      // Check CRI-O service status and logs
-      let crioStatus = 'unknown';
-      let crioLogs = [];
-      let containerErrors = [];
+      // Get all cluster nodes first
+      const kubeconfigPath = process.env.MCP_REMOTE_KUBECONFIG || process.env.KUBECONFIG || '/root/.kube/config';
+      const needsRemoteAccess = process.env.MCP_BASTION_HOST && 
+                                 process.env.MCP_BASTION_HOST !== 'localhost' &&
+                                 !process.env.RUNNING_ON_BASTION;
       
-      try {
-        // Get CRI-O service status
-        const statusCmd = 'systemctl is-active crio 2>/dev/null || echo "inactive"';
-        const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      let getNodesCmd;
+      if (needsRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST;
+        const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        getNodesCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} kubectl get nodes -o json"`;
+      } else {
+        getNodesCmd = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} kubectl get nodes -o json`;
+      }
+      
+      const nodesResult = await promisifiedExec(getNodesCmd, { maxBuffer: 1024 * 1024 * 5, timeout: 30000 });
+      const nodes = JSON.parse(nodesResult.stdout);
+      
+      if (!nodes.items || nodes.items.length === 0) {
+        throw new Error('No nodes found in cluster');
+      }
+      
+      let allCrioStatus = {};
+      let allCrioLogs = [];
+      let allContainerErrors = [];
+      
+      // Check CRI-O on each node
+      for (const node of nodes.items) {
+        const nodeName = node.metadata.name;
         
-        let fullStatusCmd;
-        if (useRemoteAccess) {
-          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-          const sshUser = process.env.MCP_BASTION_USER || 'root';
-          fullStatusCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${statusCmd}"`;
-        } else {
-          fullStatusCmd = statusCmd;
-        }
-        
-        const statusResult = await promisifiedExec(fullStatusCmd);
-        crioStatus = statusResult.stdout.trim();
-        
-        // Get recent CRI-O logs
-        const logsCmd = `journalctl -u crio --since '${hoursBack} hours ago' --lines=50 --no-pager`;
-        let fullLogsCmd;
-        
-        if (useRemoteAccess) {
-          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-          const sshUser = process.env.MCP_BASTION_USER || 'root';
-          fullLogsCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${logsCmd}"`;
-        } else {
-          fullLogsCmd = logsCmd;
-        }
-        
-        const logsResult = await promisifiedExec(fullLogsCmd);
-        const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
-        
-        // Parse logs for CRI-O specific issues
-        for (const line of logLines) {
-          if (line.toLowerCase().includes('error') || 
-              line.toLowerCase().includes('failed') ||
-              line.toLowerCase().includes('warn')) {
-            crioLogs.push({
-              timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
-              level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
-              message: line
-            });
-          }
-        }
-        
-        // If container errors are requested, check for container-specific issues
-        if (includeContainerErrors) {
-          const containerCmd = `journalctl --since '${hoursBack} hours ago' --lines=30 --no-pager | grep -i 'container\\|cri-o\\|runc'`;
-          let fullContainerCmd;
+        try {
+          // Check CRI-O status on this node
+          const statusCommand = 'systemctl is-active crio.service 2>/dev/null || echo "inactive"';
+          let statusFullCommand;
           
-          if (useRemoteAccess) {
-            const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-            const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          if (needsRemoteAccess) {
+            const sshHost = process.env.MCP_BASTION_HOST;
+            const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
             const sshUser = process.env.MCP_BASTION_USER || 'root';
-            fullContainerCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "${containerCmd}"`;
+            statusFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${statusCommand.replace(/"/g, '\\"')}\\""`; 
           } else {
-            fullContainerCmd = containerCmd;
+            statusFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${statusCommand}"`;
           }
           
-          try {
-            const containerResult = await promisifiedExec(fullContainerCmd);
-            containerErrors = containerResult.stdout.split('\n').filter(line => line.trim());
-          } catch (containerError) {
-            // Container errors are optional, don't fail if we can't get them
-            console.error('Could not retrieve container errors:', containerError.message);
+          const statusResult = await promisifiedExec(statusFullCommand, { 
+            maxBuffer: 1024 * 1024 * 5, 
+            timeout: 120000  // 2 minutes for oc debug pod creation
+          });
+          allCrioStatus[nodeName] = statusResult.stdout.trim();
+          
+          // Get CRI-O logs from this node
+          const logsCommand = `journalctl -u crio.service --since="-${hoursBack}h" --lines=50 --no-pager`;
+          let logsFullCommand;
+          
+          if (needsRemoteAccess) {
+            const sshHost = process.env.MCP_BASTION_HOST;
+            const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+            const sshUser = process.env.MCP_BASTION_USER || 'root';
+            logsFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${logsCommand.replace(/"/g, '\\"')}\\""`; 
+          } else {
+            logsFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${logsCommand}"`;
           }
+          
+          const logsResult = await promisifiedExec(logsFullCommand, { 
+            maxBuffer: 1024 * 1024 * 5, 
+            timeout: 120000  // 2 minutes for oc debug pod creation
+          });
+          
+          const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
+          
+          // Parse logs for errors and warnings
+          for (const line of logLines) {
+            if (line.toLowerCase().includes('error') || 
+                line.toLowerCase().includes('failed') ||
+                line.toLowerCase().includes('warn')) {
+              allCrioLogs.push({
+                node: nodeName,
+                timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
+                level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
+                message: line
+              });
+            }
+          }
+          
+          // If container errors are requested, check for container-specific issues on this node
+          if (includeContainerErrors) {
+            const containerCommand = `journalctl --since="-${hoursBack}h" --lines=30 --no-pager | grep -i 'container\\|pod\\|image'`;
+            let containerFullCommand;
+            
+            if (needsRemoteAccess) {
+              const sshHost = process.env.MCP_BASTION_HOST;
+              const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
+              const sshUser = process.env.MCP_BASTION_USER || 'root';
+              containerFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${containerCommand.replace(/"/g, '\\"')}\\""`; 
+            } else {
+              containerFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${containerCommand}"`;
+            }
+            
+            try {
+              const containerResult = await promisifiedExec(containerFullCommand, { 
+                maxBuffer: 1024 * 1024 * 5, 
+                timeout: 120000
+              });
+              const containerLines = containerResult.stdout.split('\n').filter(line => line.trim());
+              for (const line of containerLines) {
+                if (line.toLowerCase().includes('error') || line.toLowerCase().includes('failed')) {
+                  allContainerErrors.push({
+                    node: nodeName,
+                    message: line
+                  });
+                }
+              }
+            } catch (containerError) {
+              console.error(`Could not retrieve container errors from node ${nodeName}:`, containerError.message);
+            }
+          }
+          
+        } catch (nodeError) {
+          allCrioStatus[nodeName] = 'inaccessible';
+          allCrioLogs.push({
+            node: nodeName,
+            timestamp: new Date().toISOString(),
+            level: 'error',
+            message: `Cannot access CRI-O service on node ${nodeName}: ${nodeError.message}`
+          });
         }
-        
-      } catch (error) {
-        // If we can't check CRI-O directly, indicate we couldn't access it
-        crioStatus = 'inaccessible';
-        crioLogs.push({
-          timestamp: new Date().toISOString(),
-          level: 'error',
-          message: `Cannot access CRI-O service: ${error.message}`
-        });
       }
       
       return {
@@ -1971,11 +2067,12 @@ class OpenShiftMCPServer {
           {
             type: "text",
             text: `CRI-O Status Report:\n${JSON.stringify({
-              status: crioStatus,
-              logsAnalyzed: crioLogs.length,
-              containerErrors: includeContainerErrors ? containerErrors.length : 'not_requested',
-              recentIssues: crioLogs.slice(0, 10),
-              containerIssues: includeContainerErrors ? containerErrors.slice(0, 5) : []
+              nodesChecked: nodes.items.length,
+              status: allCrioStatus,
+              logsAnalyzed: allCrioLogs.length,
+              containerErrors: includeContainerErrors ? allContainerErrors.length : 'not_requested',
+              recentIssues: allCrioLogs.slice(0, 10),
+              containerIssues: includeContainerErrors ? allContainerErrors.slice(0, 5) : []
             }, null, 2)}`
           }
         ]
