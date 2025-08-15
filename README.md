@@ -67,7 +67,7 @@ For remote cluster access through bastion hosts, you can use either SSH key (rec
    ssh -i ~/.ssh/id_rsa_bastion user@your-bastion-host.com
    ```
 
-4. **Configure MCP environment variables**:
+4. (optional) **Configure MCP environment variables**:
    ```bash
    export MCP_BASTION_HOST="your-bastion-host.com"
    export MCP_BASTION_USER="your-username"
@@ -93,7 +93,7 @@ For environments where SSH keys are not feasible:
    sudo yum install sshpass
    ```
 
-2. **Configure MCP environment variables**:
+2. (optional) **Configure MCP environment variables**:
    ```bash
    export MCP_BASTION_HOST="your-bastion-host.com"
    export MCP_BASTION_USER="your-username"
@@ -144,7 +144,43 @@ This script will:
 After successful setup, test the remote MCP server connection:
 
 ```bash
-node simple-remote-launcher.js
+node ./scripts/simple-remote-launcher.js
+```
+You may run the script using the following options:
+
+```bash
+Usage: simple-remote-launcher.js [options]
+
+Options:
+  -H, --host <host>           Bastion host address
+  -U, --user <user>           Bastion username  
+  -P, --password <password>   Bastion password (alternative to SSH key)
+  -p, --path <path>           Remote MCP server path
+  -s, --ssh-key <keyfile>     SSH private key file path
+  -k, --kubeconfig <config>   Remote kubeconfig file path
+  -e, --env <environment>     Node environment (default: production)
+  -h, --help                  Show this help message
+
+Environment Variables (used as defaults):
+  MCP_BASTION_HOST            Bastion host address
+  MCP_BASTION_USER            Bastion username
+  MCP_BASTION_PASSWORD        Bastion password
+  MCP_REMOTE_PATH             Remote MCP server path
+  MCP_SSH_KEY                 SSH private key file path
+  MCP_REMOTE_KUBECONFIG       Remote kubeconfig file path
+  MCP_REMOTE_NODE_ENV         Node environment
+
+Examples:
+  # Using CLI arguments only
+  ./scripts/simple-remote-launcher.js -H bastion.example.com -U root -s ~/.ssh/id_rsa -k /path/to/kubeconfig -p /opt/mcp-server
+
+  # Using environment variables (backward compatible)
+  export MCP_BASTION_HOST=bastion.example.com
+  ./scripts/simple-remote-launcher.js
+
+  # Mixed: CLI args override env vars
+  export MCP_BASTION_HOST=bastion.example.com
+  ./scripts/simple-remote-launcher.js -U admin -k /custom/kubeconfig
 ```
 
 This enhanced launcher will:
