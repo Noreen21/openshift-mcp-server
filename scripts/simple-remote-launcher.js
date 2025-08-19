@@ -10,7 +10,7 @@ import { existsSync } from 'fs';
 function parseArguments() {
   const args = process.argv.slice(2);
   const config = {
-    bastionHost: process.env.MCP_BASTION_HOST || 'bastion.company.com',
+    bastionHost: process.env.MCP_BASTION_HOST || 'bastion.example.com',
     bastionUser: process.env.MCP_BASTION_USER || 'admin', 
     bastionPassword: process.env.MCP_BASTION_PASSWORD || '',
     remotePath: process.env.MCP_REMOTE_PATH || '/opt/openshift-mcp-server',
@@ -102,7 +102,7 @@ Examples:
 // Quick validation (no logging to avoid MCP interference)
 function validateConfig(config) {
   const required = ['bastionHost', 'bastionUser', 'remotePath', 'remoteKubeconfig'];
-  const missing = required.filter(key => !config[key] || config[key] === 'bastion.company.com');
+  const missing = required.filter(key => !config[key] || config[key] === 'bastion.example.com');
   
   if (missing.length > 0) {
     process.exit(1);
