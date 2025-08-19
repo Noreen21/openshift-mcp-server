@@ -72,7 +72,7 @@ done
 shift $((OPTIND-1))
 
 # Configuration
-BASTION_HOST="${MCP_BASTION_HOST:-bastion.company.com}"
+BASTION_HOST="${MCP_BASTION_HOST:-bastion.example.com}"
 BASTION_USER="${MCP_BASTION_USER:-admin}"
 BASTION_PASSWORD="${MCP_BASTION_PASSWORD:-}"
 REMOTE_PATH="${MCP_REMOTE_PATH:-/opt/openshift-mcp-server}"

@@ -28,7 +28,7 @@ users:
 ### Environment setup:
 ```bash
 export KUBECONFIG=/path/to/private-cluster-kubeconfig
-export HTTPS_PROXY=http://proxy.company.com:8080  # If using proxy
+export HTTPS_PROXY=http://proxy.example.com:8080  # If using proxy
 ```
 
 ## 2. SSH Tunnel Configuration
@@ -36,12 +36,12 @@ export HTTPS_PROXY=http://proxy.company.com:8080  # If using proxy
 ### Create tunnel to cluster (SSH Key Authentication - Recommended):
 ```bash
 # Forward local port 6443 to cluster API server
-ssh -i ~/.ssh/id_rsa -L 6443:api.openshift.internal:6443 -N bastion.company.com
+ssh -i ~/.ssh/id_rsa -L 6443:api.openshift.internal:6443 -N bastion.example.com
 
 # Or use SSH config
 cat ~/.ssh/config
 Host openshift-tunnel
-    HostName bastion.company.com
+    HostName bastion.example.com
     User admin
     IdentityFile ~/.ssh/id_rsa
     LocalForward 6443 api.openshift.internal:6443
@@ -55,7 +55,7 @@ sudo apt-get install sshpass  # Ubuntu/Debian
 # brew install sshpass        # macOS
 
 # Forward local port 6443 to cluster API server with password
-sshpass -p 'your-password' ssh -L 6443:api.openshift.internal:6443 -N bastion.company.com
+sshpass -p 'your-password' ssh -L 6443:api.openshift.internal:6443 -N bastion.example.com
 ```
 
 ### Update kubeconfig to use tunnel:
@@ -72,7 +72,7 @@ clusters:
 ### Deploy MCP server on bastion host:
 ```bash
 # Use the setup script to deploy to bastion host
-export MCP_BASTION_HOST=bastion.company.com
+export MCP_BASTION_HOST=bastion.example.com
 export MCP_BASTION_USER=admin
 export MCP_SSH_KEY=~/.ssh/id_rsa
 export MCP_REMOTE_KUBECONFIG=/path/to/kubeconfig/on/bastion
@@ -89,7 +89,7 @@ scripts/setup-bastion.sh
       "command": "ssh",
       "args": [
         "-i", "~/.ssh/id_rsa",
-        "admin@bastion.company.com",
+        "admin@bastion.example.com",
         "cd /opt/openshift-mcp-server && KUBECONFIG=/path/to/kubeconfig node index.js"
       ],
       "env": {
@@ -104,9 +104,9 @@ scripts/setup-bastion.sh
 
 ### Corporate proxy setup:
 ```bash
-export HTTP_PROXY=http://proxy.company.com:8080
-export HTTPS_PROXY=http://proxy.company.com:8080
-export NO_PROXY=localhost,127.0.0.1,.internal,.company.com
+export HTTP_PROXY=http://proxy.example.com:8080
+export HTTPS_PROXY=http://proxy.example.com:8080
+export NO_PROXY=localhost,127.0.0.1,.internal,.example.com
 
 # For Node.js applications
 export NODE_TLS_REJECT_UNAUTHORIZED=0  # Only for development with self-signed certs
@@ -157,7 +157,7 @@ curl -k -H "Authorization: Bearer $(oc whoami -t)" \
 nslookup api.openshift.internal
 
 # Test SSH connectivity to bastion
-ssh -i ~/.ssh/id_rsa admin@bastion.company.com "echo 'SSH connection successful'"
+ssh -i ~/.ssh/id_rsa admin@bastion.example.com "echo 'SSH connection successful'"
 ```
 
 ## 6. Security Considerations
