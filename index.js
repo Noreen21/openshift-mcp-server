@@ -2855,17 +2855,104 @@ ${ports.map(p => `  - port: ${p.port}
 
       // Create namespace if it doesn't exist
       try {
-        await this.k8sApi.readNamespace(namespace);
+        await this.k8sApi.readNamespace({name: namespace});
       } catch (error) {
-        if (error.response?.statusCode === 404) {
+        if (error.code === 404 || error.response?.statusCode === 404) {
           const namespaceObject = {
             metadata: { name: namespace }
           };
-          await this.k8sApi.createNamespace(namespaceObject);
+          await this.k8sApi.createNamespace({body: namespaceObject});
         }
       }
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      // Format podSelector properly
+      let podSelectorYaml = '';
+      if (podSelector && Object.keys(podSelector).length > 0) {
+        if (podSelector.matchLabels) {
+          // Already has matchLabels structure
+          podSelectorYaml = `  podSelector:
+    matchLabels:
+${Object.entries(podSelector.matchLabels).map(([k, v]) => `      ${k}: ${v}`).join('\n')}`;
+        } else {
+          // Assume it's labels directly, add matchLabels wrapper
+          podSelectorYaml = `  podSelector:
+    matchLabels:
+${Object.entries(podSelector).map(([k, v]) => `      ${k}: ${v}`).join('\n')}`;
+        }
+      } else {
+        // Empty podSelector matches all pods
+        podSelectorYaml = `  podSelector: {}`;
+      }
+
+      // Format ingress and egress as YAML lists, not JSON
+      let ingressYaml = '';
+      if (networkPolicy.spec.ingress && networkPolicy.spec.ingress.length > 0) {
+        ingressYaml = `  ingress:\n${networkPolicy.spec.ingress.map(rule => {
+          const ruleLines = [];
+          ruleLines.push('  - ');
+          if (rule.from) {
+            ruleLines.push('    from:');
+            rule.from.forEach(source => {
+              ruleLines.push('    - ' + (source.podSelector ? 'podSelector:' : source.namespaceSelector ? 'namespaceSelector:' : ''));
+              if (source.podSelector) {
+                ruleLines.push('        matchLabels:');
+                Object.entries(source.podSelector.matchLabels || source.podSelector).forEach(([k, v]) => {
+                  ruleLines.push(`          ${k}: ${v}`);
+                });
+              }
+              if (source.namespaceSelector) {
+                ruleLines.push('        matchLabels:');
+                Object.entries(source.namespaceSelector.matchLabels || source.namespaceSelector).forEach(([k, v]) => {
+                  ruleLines.push(`          ${k}: ${v}`);
+                });
+              }
+            });
+          }
+          if (rule.ports) {
+            ruleLines.push('    ports:');
+            rule.ports.forEach(port => {
+              ruleLines.push(`    - protocol: ${port.protocol || 'TCP'}`);
+              ruleLines.push(`      port: ${port.port}`);
+            });
+          }
+          return ruleLines.join('\n');
+        }).join('\n')}`;
+      }
+
+      let egressYaml = '';
+      if (networkPolicy.spec.egress && networkPolicy.spec.egress.length > 0) {
+        egressYaml = `  egress:\n${networkPolicy.spec.egress.map(rule => {
+          const ruleLines = [];
+          ruleLines.push('  - ');
+          if (rule.to) {
+            ruleLines.push('    to:');
+            rule.to.forEach(dest => {
+              ruleLines.push('    - ' + (dest.podSelector ? 'podSelector:' : dest.namespaceSelector ? 'namespaceSelector:' : ''));
+              if (dest.podSelector) {
+                ruleLines.push('        matchLabels:');
+                Object.entries(dest.podSelector.matchLabels || dest.podSelector).forEach(([k, v]) => {
+                  ruleLines.push(`          ${k}: ${v}`);
+                });
+              }
+              if (dest.namespaceSelector) {
+                ruleLines.push('        matchLabels:');
+                Object.entries(dest.namespaceSelector.matchLabels || dest.namespaceSelector).forEach(([k, v]) => {
+                  ruleLines.push(`          ${k}: ${v}`);
+                });
+              }
+            });
+          }
+          if (rule.ports) {
+            ruleLines.push('    ports:');
+            rule.ports.forEach(port => {
+              ruleLines.push(`    - protocol: ${port.protocol || 'TCP'}`);
+              ruleLines.push(`      port: ${port.port}`);
+            });
+          }
+          return ruleLines.join('\n');
+        }).join('\n')}`;
+      }
+
       const networkPolicyYaml = `apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -2874,14 +2961,11 @@ metadata:
   labels:
     managed-by: openshift-mcp-server
 spec:
-  podSelector:
-${Object.entries(podSelector).map(([k, v]) => `    ${k}: ${v}`).join('\n')}
+${podSelectorYaml}
   policyTypes:
 ${networkPolicy.spec.policyTypes.map(type => `  - ${type}`).join('\n')}
-${networkPolicy.spec.ingress ? `  ingress:
-${JSON.stringify(networkPolicy.spec.ingress, null, 2).split('\n').map(line => `  ${line}`).join('\n')}` : ''}
-${networkPolicy.spec.egress ? `  egress:
-${JSON.stringify(networkPolicy.spec.egress, null, 2).split('\n').map(line => `  ${line}`).join('\n')}` : ''}
+${ingressYaml}
+${egressYaml}
 `;
 
       const promisifiedExec = promisify(exec);
