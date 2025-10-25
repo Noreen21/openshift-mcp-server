@@ -3239,24 +3239,96 @@ spec:
       
       // Create test namespace
       try {
-        const namespaceObject = {
-          metadata: { name: testNamespace }
-        };
-        await this.k8sApi.createNamespace(namespaceObject);
+        await this.k8sApi.readNamespace({name: testNamespace});
       } catch (error) {
-        if (error.response?.statusCode !== 409) {
+        if (error.code === 404 || error.response?.statusCode === 404) {
+          const namespaceObject = {
+            metadata: { name: testNamespace }
+          };
+          await this.k8sApi.createNamespace({body: namespaceObject});
+        } else {
           throw error;
+        }
+      }
+
+      // Create directory on node for local-storage
+      const testPath = '/tmp/fio-test-data';
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      
+      try {
+        let mkdirCmd;
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+          
+          // Get first node name
+          const nodeCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl get nodes -o jsonpath='{.items[0].metadata.name}'"`;
+          const nodeResult = await promisifiedExec(nodeCmd);
+          const nodeName = nodeResult.stdout.trim();
+          
+          // Create directory on node using oc debug
+          mkdirCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} oc debug node/${nodeName} -- chroot /host mkdir -p ${testPath}"`;
+        } else {
+          const nodeResult = await promisifiedExec('kubectl get nodes -o jsonpath=\'{.items[0].metadata.name}\'');
+          const nodeName = nodeResult.stdout.trim();
+          mkdirCmd = `oc debug node/${nodeName} -- chroot /host mkdir -p ${testPath}`;
+        }
+        await promisifiedExec(mkdirCmd);
+      } catch (mkdirError) {
+        console.error('Directory creation warning:', mkdirError.message);
+      }
+
+      // Create PV for local-storage testing
+      const pvName = `fio-pv-${Date.now()}`;
+      const pv = {
+        metadata: {
+          name: pvName
+        },
+        spec: {
+          capacity: {
+            storage: volumeSize
+          },
+          volumeMode: 'Filesystem',
+          accessModes: ['ReadWriteOnce'],
+          persistentVolumeReclaimPolicy: 'Delete',
+          storageClassName: storageClass || 'local-storage',
+          local: {
+            path: testPath
+          },
+          nodeAffinity: {
+            required: {
+              nodeSelectorTerms: [
+                {
+                  matchExpressions: [
+                    {
+                      key: 'kubernetes.io/hostname',
+                      operator: 'Exists'
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      };
+
+      // Create PV
+      try {
+        await this.k8sApi.createPersistentVolume({body: pv});
+      } catch (pvError) {
+        if (pvError.code !== 409) { // Ignore if already exists
+          console.error('PV creation warning:', pvError.message);
         }
       }
 
       // Create PVC for testing
       const pvcName = `fio-test-${Date.now()}`;
       const pvc = {
-        apiVersion: 'v1',
-        kind: 'PersistentVolumeClaim',
         metadata: {
-          name: pvcName,
-          namespace: testNamespace
+          name: pvcName
         },
         spec: {
           accessModes: ['ReadWriteOnce'],
@@ -3269,44 +3341,23 @@ spec:
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
-      const pvcYaml = `apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${pvcName}
-  namespace: ${testNamespace}
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: ${volumeSize}
-${storageClass ? `  storageClassName: ${storageClass}` : ''}
-`;
+      // Create PVC using K8s API
+      const pvcResult = await this.k8sApi.createNamespacedPersistentVolumeClaim({namespace: testNamespace, body: pvc});
 
-      const promisifiedExec = promisify(exec);
-      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
-      let kubectlCmd;
-      
-      if (useRemoteAccess) {
-        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-        const sshUser = process.env.MCP_BASTION_USER || 'root';
-        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${pvcYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-      } else {
-        kubectlCmd = `echo '${pvcYaml}' | kubectl apply -f -`;
-      }
-
-      await promisifiedExec(kubectlCmd);
+      // Map test types to FIO rw parameter
+      const fioRwMap = {
+        'sequential-read': 'read',
+        'sequential-write': 'write',
+        'random-read': 'randread',
+        'random-write': 'randwrite',
+        'mixed': 'randrw'
+      };
+      const fioRw = fioRwMap[testType] || testType;
 
       // Create FIO test job
       const job = {
-        apiVersion: 'batch/v1',
-        kind: 'Job',
         metadata: {
-          name: `fio-${testType}-${Date.now()}`,
-          namespace: testNamespace
+          name: `fio-${testType}-${Date.now()}`
         },
         spec: {
           template: {
@@ -3314,12 +3365,12 @@ ${storageClass ? `  storageClassName: ${storageClass}` : ''}
               containers: [
                 {
                   name: 'fio',
-                  image: 'clusterhq/fio',
+                  image: 'quay.io/openshift/origin-tests:latest',
                   command: ['fio'],
-                  args: this.getFioArgs(testType, blockSize, duration),
+                  args: ['--name=test', `--rw=${fioRw}`, `--bs=${blockSize}`, `--runtime=${duration}`, '--ioengine=sync', '--filename=/data/testfile', '--size=100M'],
                   volumeMounts: [
                     {
-                      name: 'test-volume',
+                      name: 'test-data',
                       mountPath: '/data'
                     }
                   ]
@@ -3327,7 +3378,7 @@ ${storageClass ? `  storageClassName: ${storageClass}` : ''}
               ],
               volumes: [
                 {
-                  name: 'test-volume',
+                  name: 'test-data',
                   persistentVolumeClaim: {
                     claimName: pvcName
                   }
@@ -3340,65 +3391,61 @@ ${storageClass ? `  storageClassName: ${storageClass}` : ''}
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
-      const jobYaml = `apiVersion: batch/v1
-kind: Job
-metadata:
-  name: fio-${testType}-${Date.now()}
-  namespace: ${testNamespace}
-spec:
-  template:
-    spec:
-      containers:
-      - name: fio
-        image: quay.io/openshift/origin-tests:latest
-        command: ["fio"]
-        args: ["--name=test", "--rw=${testType}", "--bs=${blockSize}", "--runtime=${duration}", "--ioengine=libaio", "--direct=1", "--filename=/data/testfile", "--size=1G"]
-        volumeMounts:
-        - name: test-data
-          mountPath: /data
-      volumes:
-      - name: test-data
-        persistentVolumeClaim:
-          claimName: ${pvcName}
-      restartPolicy: Never
-  backoffLimit: 0
-`;
-
-      let kubectlJobCmd;
-      if (useRemoteAccess) {
-        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-        const sshUser = process.env.MCP_BASTION_USER || 'root';
-        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlJobCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${jobYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-      } else {
-        kubectlJobCmd = `echo '${jobYaml}' | kubectl apply -f -`;
-      }
-
-      await promisifiedExec(kubectlJobCmd);
+      // Create job using K8s API
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
-      const jobResult = { metadata: { name: `fio-${testType}-${Date.now()}` } };
+      const jobResult = await batchApi.createNamespacedJob({namespace: testNamespace, body: job});
+      const jobName = jobResult.body?.metadata?.name || jobResult.metadata?.name || job.metadata.name;
 
       // Wait for job completion (simplified - in production, use proper polling)
       await new Promise(resolve => setTimeout(resolve, parseInt(duration) * 1000 + 30000));
 
-      // Get job logs
-      const execAsync = promisify(exec);
-      const kubeconfigPath = process.env.MCP_REMOTE_KUBECONFIG || process.env.KUBECONFIG;
-      const logCommand = `kubectl logs job/${jobResult.metadata.name} -n ${testNamespace} --kubeconfig ${kubeconfigPath}`;
-      
+      // Get job logs using Log API
       let logs = '';
       try {
-        const logResult = await execAsync(logCommand);
-        logs = logResult.stdout;
+        // Get pods for the job
+        const podsResponse = await this.k8sApi.listNamespacedPod({
+          namespace: testNamespace,
+          labelSelector: `job-name=${jobName}`
+        });
+        
+        const items = podsResponse.body?.items || podsResponse.items || [];
+        if (items.length > 0) {
+          const podName = items[0].metadata.name;
+          
+          // Use Log API which returns plain text, not JSON
+          const logApi = this.kubeConfig.makeApiClient(k8s.Log);
+          try {
+            logs = await logApi.log(testNamespace, podName, undefined, {
+              follow: false,
+              tailLines: 1000,
+              pretty: false,
+              timestamps: false
+            });
+          } catch (logError) {
+            // Fallback: try direct API call
+            const logResponse = await this.k8sApi.readNamespacedPodLog({
+              name: podName, 
+              namespace: testNamespace,
+              container: undefined
+            });
+            logs = typeof logResponse === 'string' ? logResponse : 
+                   (logResponse.body ? String(logResponse.body) : 'Log format not recognized');
+          }
+        } else {
+          logs = 'No pods found for job';
+        }
       } catch (error) {
-        logs = 'Failed to retrieve logs';
+        logs = `Failed to retrieve logs: ${error.message}`;
       }
 
       // Cleanup
-      await batchApi.deleteNamespacedJob(jobResult.metadata.name, testNamespace);
-      await this.k8sApi.deleteNamespacedPersistentVolumeClaim(pvcName, testNamespace);
+      try {
+        await batchApi.deleteNamespacedJob({name: jobName, namespace: testNamespace});
+        await this.k8sApi.deleteNamespacedPersistentVolumeClaim({name: pvcName, namespace: testNamespace});
+        await this.k8sApi.deletePersistentVolume({name: pvName});
+      } catch (cleanupError) {
+        console.error('Cleanup warning:', cleanupError.message);
+      }
 
       return {
         content: [
