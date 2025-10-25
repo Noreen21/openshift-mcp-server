@@ -73,31 +73,58 @@ shift $((OPTIND-1))
 
 # Configuration
 BASTION_HOST="${MCP_BASTION_HOST:-bastion.example.com}"
-BASTION_USER="${MCP_BASTION_USER:-admin}"
+BASTION_USER="${MCP_BASTION_USER:-}"
 BASTION_PASSWORD="${MCP_BASTION_PASSWORD:-}"
 REMOTE_PATH="${MCP_REMOTE_PATH:-/opt/openshift-mcp-server}"
 SSH_KEY="${MCP_SSH_KEY:-$HOME/.ssh/id_rsa}"
-REMOTE_KUBECONFIG="${MCP_REMOTE_KUBECONFIG:-~/.kube/config}"
-
-log() {
-    echo -e "\033[0;32m[SETUP]\033[0m $1"
-}
+REMOTE_KUBECONFIG="${MCP_REMOTE_KUBECONFIG:-}"
+BASTION_REMOTE="${BASTION_USER:+$BASTION_USER@}${BASTION_HOST}"
 
 verbose() {
-    if ((verbose)) ; then echo -e "\033[0;34m[SETUP]\033[0m $1" ; fi
+    if ((verbose)) ; then echo -e "\033[0;34m[SETUP]\033[0m $*" ; fi
 }
 
 error() {
-    echo -e "\033[0;31m[ERROR]\033[0m $1"
+    echo -e "\033[0;31m[ERROR]\033[0m $*"
 }
 
 warn() {
-    echo -e "\033[1;33m[SETUP]\033[0m $1"
+    echo -e "\033[1;33m[WARNING]\033[0m $*"
+}
+
+log() {
+    if [[ "$*" = "ERROR: "* ]] ; then
+	error "${*#ERROR: }"
+    elif [[ "$*" = "WARNING: "* ]] ; then
+	warn "${*#XARNING: }"
+    else
+	echo -e "\033[0;32m[SETUP]\033[0m $*"
+    fi
+}
+
+elog() {
+    if [[ "$*" = "ERROR: "* ]] ; then
+	error "${*#ERROR: }"
+    else
+	warn "${*#WARNING: }"
+    fi
 }
 
 doit() {
     verbose "$*"
-    if ((doit)) ; then "$@" ; fi
+    local line
+    if ((doit)) ; then
+	(
+	    (
+		while IFS=$'\n' read -r line ; do
+		    log "$line" 1>&3
+		done <<< "$("$@")"
+	    ) 2>&1 |
+		while IFS=$'\n' read -r line ; do
+		    elog "$line"
+		done
+	) 3>&1
+	fi
 }
 
 log "Setting up MCP server on bastion host: $BASTION_HOST"
@@ -132,7 +159,7 @@ fi
 log "Testing SSH connectivity to bastion host..."
 if [[ -n "$BASTION_PASSWORD" ]]; then
     # Test with password
-    if ! sshpass -p "$BASTION_PASSWORD" ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no "$BASTION_USER@$BASTION_HOST" "echo 'Connection successful'" >/dev/null 2>&1; then
+    if ! sshpass -p "$BASTION_PASSWORD" ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no "$BASTION_REMOTE" "echo 'Connection successful'" >/dev/null 2>&1; then
         error "Cannot connect to bastion host: $BASTION_HOST"
         error "Please verify:"
         error "1. Password is correct"
@@ -142,7 +169,7 @@ if [[ -n "$BASTION_PASSWORD" ]]; then
     fi
 else
     # Test with SSH key
-    if ! ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no -q "$BASTION_USER@$BASTION_HOST" "echo 'Connection successful'" >/dev/null 2>&1; then
+    if ! ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no -q "$BASTION_REMOTE" "echo 'Connection successful'" >/dev/null 2>&1; then
         error "Cannot connect to bastion host: $BASTION_HOST"
         error "Please ensure:"
         error "1. SSH key is properly configured: $SSH_KEY"
@@ -157,7 +184,7 @@ log "SSH connectivity verified successfully"
 
 # Check and install Node.js on bastion host
 log "Checking Node.js installation on bastion host..."
-doit $"${SSH_CMD[@]}" "$BASTION_USER@$BASTION_HOST" "
+doit $"${SSH_CMD[@]}" "$BASTION_REMOTE" "
     if ! command -v node >/dev/null 2>&1; then
         echo 'Node.js not found. Installing Node.js 18.x...'
 
@@ -172,6 +199,11 @@ doit $"${SSH_CMD[@]}" "$BASTION_USER@$BASTION_HOST" "
             echo 'Installing on older RHEL/CentOS system...'
             curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
             sudo yum install -y nodejs
+        elif command -v zypper >/dev/null 2>&1; then
+            # SUSE
+            echo 'Installing on SUSE/OpenSUSE system...'
+            curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
+            sudo zypper install -y nodejs
         elif command -v apt-get >/dev/null 2>&1; then
             # Ubuntu/Debian
             echo 'Installing on Ubuntu/Debian system...'
@@ -179,7 +211,7 @@ doit $"${SSH_CMD[@]}" "$BASTION_USER@$BASTION_HOST" "
             sudo apt-get install -y nodejs
         else
             echo 'ERROR: Cannot determine package manager. Please install Node.js manually.'
-            echo 'Required: Node.js 18.x or later with npm'
+            echo 'ERROR: Required: Node.js 18.x or later with npm'
             exit 1
         fi
 
@@ -192,7 +224,7 @@ doit $"${SSH_CMD[@]}" "$BASTION_USER@$BASTION_HOST" "
 
 # Create remote directory
 log "Creating remote directory: $REMOTE_PATH"
-doit "${SSH_CMD[@]}" "$BASTION_USER@$BASTION_HOST" "
+doit "${SSH_CMD[@]}" "$BASTION_REMOTE" "
     sudo mkdir -p '$REMOTE_PATH' && \
     sudo chown \$(whoami):\$(whoami) '$REMOTE_PATH'
 "
@@ -208,29 +240,33 @@ doit "${RSYNC_CMD[@]}" \
     --exclude '*.log' \
     --exclude '.cursor' \
     --exclude 'openshift-mcp-server' \
-    ./ "$BASTION_USER@$BASTION_HOST:$REMOTE_PATH/"
+    ./ "$BASTION_REMOTE:$REMOTE_PATH/"
 
 # Install dependencies on remote host
 log "Installing Node.js dependencies on bastion host..."
-doit $"${SSH_CMD[@]}" "$BASTION_USER@$BASTION_HOST" "
+doit $"${SSH_CMD[@]}" "$BASTION_REMOTE" "
     cd '$REMOTE_PATH' && \
     npm install --production
 "
 
 # Check if kubeconfig exists
-log "Checking kubeconfig on bastion host: $REMOTE_KUBECONFIG"
-doit $"${SSH_CMD[@]}" "$BASTION_USER@$BASTION_HOST" "
-    if [[ ! -f '$REMOTE_KUBECONFIG' ]]; then
-        echo 'WARNING: $REMOTE_KUBECONFIG not found on bastion host'
-        echo 'Please ensure kubeconfig is configured for OpenShift cluster access'
-        if [[ '$REMOTE_KUBECONFIG' != '~/.kube/config' ]]; then
-            echo 'Alternative: Check if ~/.kube/config exists instead'
-            ls -la ~/.kube/config 2>/dev/null || echo 'Default kubeconfig also not found'
-        fi
+log "Checking kubeconfig on bastion host${REMOTE_KUBECONFIG:+: $REMOTE_KUBECONFIG}"
+doit $"${SSH_CMD[@]}" "$BASTION_REMOTE" "
+    if [[ -z '$REMOTE_KUBECONFIG' ]] && kubectl cluster-info ; then
+        echo 'Cluster connectivity test passed'
     else
-        echo 'kubeconfig found - testing cluster connectivity...'
-        export KUBECONFIG='$REMOTE_KUBECONFIG'
-        kubectl cluster-info || echo 'Cluster connectivity test failed'
+	if [[ ! -f '$REMOTE_KUBECONFIG' ]] ; then
+	    echo 'ERROR: $REMOTE_KUBECONFIG not found on bastion host'
+	    echo 'Please ensure kubeconfig is configured for OpenShift cluster access'
+	    if [[ '$REMOTE_KUBECONFIG' != '~/.kube/config' ]]; then
+		echo 'Alternative: Check if ~/.kube/config exists instead'
+		ls -la ~/.kube/config 2>/dev/null || echo 'ERROR: Default kubeconfig also not found'
+	    fi
+	else
+	    echo 'kubeconfig found - testing cluster connectivity...'
+	    export KUBECONFIG='$REMOTE_KUBECONFIG'
+	    kubectl cluster-info || echo 'ERROR: Cluster connectivity test failed'
+	fi
     fi
 "
 
