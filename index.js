@@ -3838,23 +3838,26 @@ spec:
       
       // Create test namespace
       try {
-        const namespaceObject = {
-          metadata: { name: testNamespace }
-        };
-        await this.k8sApi.createNamespace(namespaceObject);
+        await this.k8sApi.readNamespace({name: testNamespace});
       } catch (error) {
-        if (error.response?.statusCode !== 409) {
+        if (error.code === 404 || error.response?.statusCode === 404) {
+          const namespaceObject = {
+            metadata: { name: testNamespace }
+          };
+          await this.k8sApi.createNamespace({body: namespaceObject});
+        } else {
           throw error;
         }
       }
 
       const stressArgs = this.getStressTestArgs(testType, duration, cpuCores, memorySize);
+      const jobName = `stress-test-${testType}-${Date.now()}`;
 
       const job = {
         apiVersion: 'batch/v1',
         kind: 'Job',
         metadata: {
-          name: `stress-test-${testType}-${Date.now()}`,
+          name: jobName,
           namespace: testNamespace
         },
         spec: {
@@ -3886,11 +3889,13 @@ spec:
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      // Format args for YAML (quote all values to avoid type confusion)
+      const argsYaml = stressArgs.map(arg => `        - "${String(arg)}"`).join('\n');
+      
       const jobYaml = `apiVersion: batch/v1
 kind: Job
 metadata:
-  name: stress-test-${testType}-${Date.now()}
+  name: ${jobName}
   namespace: ${testNamespace}
 spec:
   template:
@@ -3899,7 +3904,8 @@ spec:
       - name: stress
         image: polinux/stress
         command: ["stress"]
-        args: ${JSON.stringify(stressArgs)}
+        args:
+${argsYaml}
         resources:
           requests:
             cpu: ${cpuCores}000m
@@ -3913,6 +3919,10 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
   backoffLimit: 0
 `;
 
+      // Write YAML to temp file to avoid shell escaping issues
+      const tmpFile = `/tmp/stress-test-job-${Date.now()}.yaml`;
+      writeFileSync(tmpFile, jobYaml);
+      
       const promisifiedExec = promisify(exec);
       const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
       let kubectlCmd;
@@ -3922,24 +3932,30 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
         const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
         const sshUser = process.env.MCP_BASTION_USER || 'root';
         const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${jobYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+        const remoteTmpFile = `/tmp/stress-test-job-${Date.now()}.yaml`;
+        
+        // Copy file to remote
+        await promisifiedExec(`scp -i ${sshKey} -o StrictHostKeyChecking=no ${tmpFile} ${sshUser}@${sshHost}:${remoteTmpFile}`);
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl apply -f ${remoteTmpFile} && rm -f ${remoteTmpFile}"`;
       } else {
-        kubectlCmd = `echo '${jobYaml}' | kubectl apply -f -`;
+        kubectlCmd = `kubectl apply -f ${tmpFile}`;
       }
 
       await promisifiedExec(kubectlCmd);
+      
+      // Clean up local temp file
+      unlinkSync(tmpFile);
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
-      const jobResult = { metadata: { name: `stress-test-${testType}-${Date.now()}` } };
 
       // Wait for test completion
       const durationSeconds = this.parseDuration(duration);
       await new Promise(resolve => setTimeout(resolve, durationSeconds * 1000 + 30000));
 
       // Get job status
-      const finalJob = await batchApi.readNamespacedJob(jobResult.metadata.name, testNamespace);
+      const finalJob = await batchApi.readNamespacedJob({name: jobName, namespace: testNamespace});
       
       // Cleanup
-      await batchApi.deleteNamespacedJob(jobResult.metadata.name, testNamespace);
+      await batchApi.deleteNamespacedJob({name: jobName, namespace: testNamespace});
 
       return {
         content: [
