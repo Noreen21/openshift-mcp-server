@@ -16,6 +16,7 @@ import {
 import * as k8s from '@kubernetes/client-node';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { writeFileSync, unlinkSync } from 'fs';
 // Using built-in fetch available in Node.js 18+
 
 /**
@@ -3945,47 +3946,135 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
       
       // Create test namespace
       try {
-        const namespaceObject = {
-          metadata: { name: testNamespace }
-        };
-        await this.k8sApi.createNamespace(namespaceObject);
+        await this.k8sApi.readNamespace({name: testNamespace});
       } catch (error) {
-        if (error.response?.statusCode !== 409) {
+        if (error.code === 404 || error.response?.statusCode === 404) {
+          const namespaceObject = {
+            metadata: { name: testNamespace }
+          };
+          await this.k8sApi.createNamespace({body: namespaceObject});
+        } else {
           throw error;
         }
       }
 
       const durationSeconds = this.parseDuration(duration);
+      const serviceName = `db-${dbType}-svc`;
+      
+      // Deploy database server first
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      
+      let dbDeploymentYaml, dbServiceYaml;
+      if (dbType === 'postgresql') {
+        dbDeploymentYaml = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-db
+  namespace: ${testNamespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-db
+  template:
+    metadata:
+      labels:
+        app: postgres-db
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:13
+        env:
+        - name: POSTGRES_PASSWORD
+          value: postgres123
+        - name: POSTGRES_DB
+          value: postgres
+        ports:
+        - containerPort: 5432
+`;
+        dbServiceYaml = `apiVersion: v1
+kind: Service
+metadata:
+  name: ${serviceName}
+  namespace: ${testNamespace}
+spec:
+  selector:
+    app: postgres-db
+  ports:
+  - port: 5432
+    targetPort: 5432
+`;
+      } else if (dbType === 'mysql') {
+        dbDeploymentYaml = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-db
+  namespace: ${testNamespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-db
+  template:
+    metadata:
+      labels:
+        app: mysql-db
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: mysql123
+        - name: MYSQL_DATABASE
+          value: test
+        ports:
+        - containerPort: 3306
+`;
+        dbServiceYaml = `apiVersion: v1
+kind: Service
+metadata:
+  name: ${serviceName}
+  namespace: ${testNamespace}
+spec:
+  selector:
+    app: mysql-db
+  ports:
+  - port: 3306
+    targetPort: 3306
+`;
+      } else {
+        throw new Error(`Unsupported database type: ${dbType}`);
+      }
+
+      // Deploy database
+      let kubectlDeployCmd, kubectlServiceCmd;
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+        kubectlDeployCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${dbDeploymentYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+        kubectlServiceCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${dbServiceYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+      } else {
+        kubectlDeployCmd = `echo '${dbDeploymentYaml}' | kubectl apply -f -`;
+        kubectlServiceCmd = `echo '${dbServiceYaml}' | kubectl apply -f -`;
+      }
+
+      await promisifiedExec(kubectlDeployCmd);
+      await promisifiedExec(kubectlServiceCmd);
+
+      // Wait for database to be ready (60 seconds)
+      await new Promise(resolve => setTimeout(resolve, 60000));
       
       let benchmarkCommand;
       if (dbType === 'postgresql') {
-        benchmarkCommand = [
-          'pgbench',
-          '-h', 'localhost',
-          '-p', '5432',
-          '-U', 'postgres',
-          '-c', threads.toString(),
-          '-j', Math.min(threads, 4).toString(),
-          '-T', durationSeconds.toString(),
-          '-S', // Select-only for read-only
-          'postgres'
-        ];
+        const pgCmd = `sleep 5 && PGPASSWORD=postgres123 pgbench -h ${serviceName} -p 5432 -U postgres -c ${threads} -j ${Math.min(threads, 4)} -T ${durationSeconds} -i postgres && PGPASSWORD=postgres123 pgbench -h ${serviceName} -p 5432 -U postgres -c ${threads} -j ${Math.min(threads, 4)} -T ${durationSeconds} postgres`;
+        benchmarkCommand = ['sh', '-c', pgCmd];
       } else if (dbType === 'mysql') {
-        benchmarkCommand = [
-          'sysbench',
-          `oltp_${testType}`,
-          '--mysql-host=localhost',
-          '--mysql-port=3306',
-          '--mysql-user=root',
-          '--mysql-password=mysql123',
-          '--mysql-db=test',
-          `--threads=${threads}`,
-          `--time=${durationSeconds}`,
-          `--table-size=${tableSize}`,
-          'run'
-        ];
-      } else {
-        throw new Error(`Unsupported database type: ${dbType}`);
+        const mysqlCmd = `sleep 10 && sysbench oltp_${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} prepare && sysbench oltp_${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} run`;
+        benchmarkCommand = ['sh', '-c', mysqlCmd];
       }
 
       const job = {
@@ -4012,11 +4101,23 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
+      // Format command array for YAML (escape special chars but don't quote simple strings)
+      const commandYaml = benchmarkCommand.map(arg => {
+        const argStr = String(arg);
+        // Quote if contains spaces or special chars, and escape internal quotes
+        if (argStr.includes(' ') || argStr.includes(':') || argStr.includes('#') || argStr.includes('&')) {
+          // Escape any double quotes in the string
+          const escapedStr = argStr.replace(/"/g, '\\"');
+          return `        - "${escapedStr}"`;
+        }
+        return `        - ${argStr}`;
+      }).join('\n');
+      
+      const jobName = `db-benchmark-${dbType}-${Date.now()}`;
       const jobYaml = `apiVersion: batch/v1
 kind: Job
 metadata:
-  name: db-benchmark-${dbType}-${Date.now()}
+  name: ${jobName}
   namespace: ${testNamespace}
 spec:
   template:
@@ -4024,13 +4125,16 @@ spec:
       containers:
       - name: benchmark
         image: ${dbType === 'postgresql' ? 'postgres:13' : 'perconalab/sysbench'}
-        command: ${JSON.stringify(benchmarkCommand)}
+        command:
+${commandYaml}
       restartPolicy: Never
   backoffLimit: 0
 `;
 
-      const promisifiedExec = promisify(exec);
-      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      // Write YAML to temp file to avoid shell escaping issues
+      const tmpFile = `/tmp/db-benchmark-job-${Date.now()}.yaml`;
+      writeFileSync(tmpFile, jobYaml);
+      
       let kubectlCmd;
       
       if (useRemoteAccess) {
@@ -4038,14 +4142,21 @@ spec:
         const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
         const sshUser = process.env.MCP_BASTION_USER || 'root';
         const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${jobYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
+        const remoteTmpFile = `/tmp/db-benchmark-job-${Date.now()}.yaml`;
+        
+        // Copy file to remote
+        await promisifiedExec(`scp -i ${sshKey} -o StrictHostKeyChecking=no ${tmpFile} ${sshUser}@${sshHost}:${remoteTmpFile}`);
+        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl apply -f ${remoteTmpFile} && rm -f ${remoteTmpFile}"`;
       } else {
-        kubectlCmd = `echo '${jobYaml}' | kubectl apply -f -`;
+        kubectlCmd = `kubectl apply -f ${tmpFile}`;
       }
 
       await promisifiedExec(kubectlCmd);
+      
+      // Clean up local temp file
+      unlinkSync(tmpFile);
+      
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
-      const jobResult = { metadata: { name: `db-benchmark-${dbType}-${Date.now()}` } };
 
       // Wait for test completion
       await new Promise(resolve => setTimeout(resolve, durationSeconds * 1000 + 30000));
@@ -4053,7 +4164,7 @@ spec:
       // Get results
       const execAsync = promisify(exec);
       const kubeconfigPath = process.env.MCP_REMOTE_KUBECONFIG || process.env.KUBECONFIG;
-      const logCommand = `kubectl logs job/${jobResult.metadata.name} -n ${testNamespace} --kubeconfig ${kubeconfigPath}`;
+      const logCommand = `kubectl logs job/${jobName} -n ${testNamespace} --kubeconfig ${kubeconfigPath}`;
       
       let results = '';
       try {
@@ -4064,7 +4175,17 @@ spec:
       }
 
       // Cleanup
-      await batchApi.deleteNamespacedJob(jobResult.metadata.name, testNamespace);
+      try {
+        await batchApi.deleteNamespacedJob({name: jobName, namespace: testNamespace});
+        
+        // Clean up database deployment and service
+        const appsApi = this.kubeConfig.makeApiClient(k8s.AppsV1Api);
+        const dbDeploymentName = dbType === 'postgresql' ? 'postgres-db' : 'mysql-db';
+        await appsApi.deleteNamespacedDeployment({name: dbDeploymentName, namespace: testNamespace});
+        await this.k8sApi.deleteNamespacedService({name: serviceName, namespace: testNamespace});
+      } catch (cleanupError) {
+        console.error('Cleanup warning:', cleanupError.message);
+      }
 
       return {
         content: [
