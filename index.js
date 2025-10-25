@@ -2289,23 +2289,20 @@ ${ports.map(port => `        - containerPort: ${port.containerPort}
 
       // Create namespace if it doesn't exist
       try {
-        await this.k8sApi.readNamespace(namespace);
+        await this.k8sApi.readNamespace({name: namespace});
       } catch (error) {
-        if (error.response?.statusCode === 404) {
+        if (error.code === 404 || error.response?.statusCode === 404) {
           const namespaceObject = {
             metadata: { name: namespace }
           };
-          await this.k8sApi.createNamespace(namespaceObject);
+          await this.k8sApi.createNamespace({body: namespaceObject});
         }
       }
 
-      // Create PVC
+      // Create PVC using K8s API
       const pvc = {
-        apiVersion: 'v1',
-        kind: 'PersistentVolumeClaim',
         metadata: {
-          name: `${name}-storage`,
-          namespace
+          name: `${name}-storage`
         },
         spec: {
           accessModes: ['ReadWriteOnce'],
@@ -2317,35 +2314,7 @@ ${ports.map(port => `        - containerPort: ${port.containerPort}
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
-      const pvcYaml = `apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${name}-storage
-  namespace: ${namespace}
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: ${storageSize}
-`;
-
-      const promisifiedExec = promisify(exec);
-      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
-      let kubectlPvcCmd;
-      
-      if (useRemoteAccess) {
-        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-        const sshUser = process.env.MCP_BASTION_USER || 'root';
-        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlPvcCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${pvcYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-      } else {
-        kubectlPvcCmd = `echo '${pvcYaml}' | kubectl apply -f -`;
-      }
-
-      await promisifiedExec(kubectlPvcCmd);
+      await this.k8sApi.createNamespacedPersistentVolumeClaim({namespace, body: pvc});
 
       // Create Deployment
       const deployment = {
@@ -2418,85 +2387,26 @@ spec:
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug  
-      const deploymentYaml = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${name}
-  namespace: ${namespace}
-  labels:
-    app: ${name}
-    type: database
-    managed-by: openshift-mcp-server
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: ${name}
-  template:
-    metadata:
-      labels:
-        app: ${name}
-        type: database
-    spec:
-      containers:
-      - name: ${type}
-        image: ${type === 'postgresql' ? 'postgres:latest' : type === 'mysql' ? 'mysql:latest' : type === 'mongodb' ? 'mongo:latest' : 'redis:latest'}
-        ports:
-        - containerPort: ${type === 'postgresql' ? 5432 : type === 'mysql' ? 3306 : type === 'mongodb' ? 27017 : 6379}
-          protocol: TCP
-        resources:
-          requests:
-            cpu: "${resources.cpuRequest || '250m'}"
-            memory: "${resources.memoryRequest || '512Mi'}"
-          limits:
-            cpu: "${resources.cpuLimit || resources.cpuRequest || '1000m'}"
-            memory: "${resources.memoryLimit || resources.memoryRequest || '1Gi'}"
-        env:
-        - name: POSTGRES_DB
-          value: "${name}"
-        - name: POSTGRES_USER  
-          value: "admin"
-        - name: POSTGRES_PASSWORD
-          value: "password"
-        volumeMounts:
-        - name: ${name}-storage
-          mountPath: /var/lib/postgresql/data
-      volumes:
-      - name: ${name}-storage
-        persistentVolumeClaim:
-          claimName: ${name}-pvc
-`;
-
-      let kubectlCmd;
+      // Create Deployment using K8s API
+      const appsApi = this.kubeConfig.makeApiClient(k8s.AppsV1Api);
       
-      if (useRemoteAccess) {
-        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-        const sshUser = process.env.MCP_BASTION_USER || 'root';
-        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${deploymentYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-      } else {
-        kubectlCmd = `echo '${deploymentYaml}' | kubectl apply -f -`;
-      }
-
-      const kubectlResult = await promisifiedExec(kubectlCmd);
-      
-      // Mock the result format expected by the rest of the function
-      const deploymentResult = {
-        metadata: {
-          name: deployment.metadata.name,
-          namespace: namespace
-        }
+      // Remove apiVersion, kind, and namespace from deployment body
+      const deploymentBody = {
+        metadata: deployment.metadata,
+        spec: deployment.spec
       };
+      
+      const deploymentResult = await appsApi.createNamespacedDeployment({namespace, body: deploymentBody});
 
-      // Create Service
+      // Create Service using K8s API
       const service = {
-        apiVersion: 'v1',
-        kind: 'Service',
         metadata: {
           name,
-          namespace
+          labels: {
+            app: name,
+            'db-type': type,
+            'managed-by': 'openshift-mcp-server'
+          }
         },
         spec: {
           selector: {
@@ -2512,44 +2422,15 @@ spec:
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
-      const serviceYaml = `apiVersion: v1
-kind: Service
-metadata:
-  name: ${name}
-  namespace: ${namespace}
-  labels:
-    app: ${name}
-    db-type: ${type}
-    managed-by: openshift-mcp-server
-spec:
-  selector:
-    app: ${name}
-  ports:
-  - port: ${config.port}
-    targetPort: ${config.port}
-    protocol: TCP
-`;
-
-      if (useRemoteAccess) {
-        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-        const sshUser = process.env.MCP_BASTION_USER || 'root';
-        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${serviceYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-      } else {
-        kubectlCmd = `echo '${serviceYaml}' | kubectl apply -f -`;
-      }
-
-      await promisifiedExec(kubectlCmd);
+      await this.k8sApi.createNamespacedService({namespace, body: service});
 
       return {
         content: [
           {
             type: "text",
             text: `Database "${name}" (${type}) deployed successfully in namespace "${namespace}":\n${JSON.stringify({
-              name: deploymentResult.metadata.name,
-              namespace: deploymentResult.metadata.namespace,
+              name: (deploymentResult.body?.metadata || deploymentResult.metadata).name,
+              namespace: namespace,
               type,
               image: config.image,
               port: config.port,
@@ -2577,22 +2458,11 @@ spec:
       } = args;
       const namespace = inputNamespace || 'default';
 
-      // Verify deployment exists
-      const promisifiedExec = promisify(exec);
-      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      // Verify deployment exists using K8s API
+      const appsApi = this.kubeConfig.makeApiClient(k8s.AppsV1Api);
       
       try {
-        let verifyCmd;
-        if (useRemoteAccess) {
-          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-          const sshUser = process.env.MCP_BASTION_USER || 'root';
-          const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-          verifyCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl get deployment ${targetDeployment} -n ${namespace}"`;
-        } else {
-          verifyCmd = `kubectl get deployment ${targetDeployment} -n ${namespace}`;
-        }
-        await promisifiedExec(verifyCmd);
+        await appsApi.readNamespacedDeployment({name: targetDeployment, namespace});
       } catch (error) {
         throw new Error(`Deployment "${targetDeployment}" not found in namespace "${namespace}"`);
       }
@@ -2640,63 +2510,25 @@ spec:
         }
       };
 
-      // WORKAROUND: Use kubectl directly due to client library namespace parameter bug
-      const hpaYaml = `apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: ${targetDeployment}-hpa
-  namespace: ${namespace}
-  labels:
-    managed-by: openshift-mcp-server
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: ${targetDeployment}
-  minReplicas: ${minReplicas}
-  maxReplicas: ${maxReplicas}
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: ${cpuTarget}
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: ${memoryTarget}
-`;
-
-      let kubectlCmd;
+      // Create HPA using K8s API
+      const autoscalingApi = this.kubeConfig.makeApiClient(k8s.AutoscalingV2Api);
       
-      if (useRemoteAccess) {
-        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-        const sshUser = process.env.MCP_BASTION_USER || 'root';
-        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${hpaYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-      } else {
-        kubectlCmd = `echo '${hpaYaml}' | kubectl apply -f -`;
-      }
-
+      // Remove apiVersion and kind from hpa body
+      const hpaBody = {
+        metadata: hpa.metadata,
+        spec: hpa.spec
+      };
+      
       try {
-        const kubectlResult = await promisifiedExec(kubectlCmd);
-        
-        // Mock the result format expected by the rest of the function
-        const result = {
-          metadata: { name: `${targetDeployment}-hpa`, namespace: namespace }
-        };
+        const result = await autoscalingApi.createNamespacedHorizontalPodAutoscaler({namespace, body: hpaBody});
         
         return {
           content: [
             {
               type: "text",
               text: `HPA "${targetDeployment}-hpa" created successfully for deployment "${targetDeployment}":\n${JSON.stringify({
-                name: result.metadata.name,
-                namespace: result.metadata.namespace,
+                name: (result.body?.metadata || result.metadata).name,
+                namespace: namespace,
                 targetDeployment,
                 minReplicas,
                 maxReplicas,
