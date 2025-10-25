@@ -1551,7 +1551,7 @@ class OpenShiftMCPServer {
       const logOutput = result.stdout.trim();
       
       // Parse and analyze the logs
-      const analysis = this.parseJournalctlLogs(logOutput, pod, service, errorTypes);
+      const analysis = this.parseJournalctlLogs(logOutput, pod, service, errorTypes, hoursBack);
       
       return {
         content: [
@@ -1576,7 +1576,7 @@ class OpenShiftMCPServer {
     }
   }
   
-  parseJournalctlLogs(logOutput, pod, service, errorTypes) {
+  parseJournalctlLogs(logOutput, pod, service, errorTypes, hoursBack = 24) {
     const lines = logOutput.split('\n').filter(line => line.trim());
     
     if (lines.length === 0) {
@@ -2467,7 +2467,7 @@ spec:
           claimName: ${name}-pvc
 `;
 
-      let kubectlServiceCmd;
+      let kubectlCmd;
       
       if (useRemoteAccess) {
         const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
