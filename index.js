@@ -2577,13 +2577,23 @@ spec:
       const namespace = inputNamespace || 'default';
 
       // Verify deployment exists
+      const promisifiedExec = promisify(exec);
+      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+      
       try {
-        await this.appsApi.readNamespacedDeployment(targetDeployment, namespace);
-      } catch (error) {
-        if (error.response?.statusCode === 404) {
-          throw new Error(`Deployment "${targetDeployment}" not found in namespace "${namespace}"`);
+        let verifyCmd;
+        if (useRemoteAccess) {
+          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+          verifyCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl get deployment ${targetDeployment} -n ${namespace}"`;
+        } else {
+          verifyCmd = `kubectl get deployment ${targetDeployment} -n ${namespace}`;
         }
-        throw error;
+        await promisifiedExec(verifyCmd);
+      } catch (error) {
+        throw new Error(`Deployment "${targetDeployment}" not found in namespace "${namespace}"`);
       }
 
       const hpa = {
@@ -2659,8 +2669,6 @@ spec:
         averageUtilization: ${memoryTarget}
 `;
 
-      const promisifiedExec = promisify(exec);
-      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
       let kubectlCmd;
       
       if (useRemoteAccess) {
