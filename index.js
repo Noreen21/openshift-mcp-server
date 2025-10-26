@@ -17,6 +17,7 @@ import * as k8s from '@kubernetes/client-node';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { writeFileSync, unlinkSync } from 'fs';
+import { Writable } from 'stream';
 // Using built-in fetch available in Node.js 18+
 
 /**
@@ -346,7 +347,7 @@ class OpenShiftMCPServer {
               properties: {
                 type: {
                   type: "string",
-                  enum: ["postgresql", "mysql", "mongodb", "redis"],
+                  enum: ["mysql", "mongodb", "redis"],
                   description: "Database type"
                 },
                 name: {
@@ -625,14 +626,14 @@ class OpenShiftMCPServer {
            },
            {
              name: "run_database_benchmark",
-             description: "Execute database performance tests with sysbench or pgbench",
+             description: "Execute MySQL database performance tests with sysbench",
              inputSchema: {
                type: "object",
                properties: {
                  dbType: {
                    type: "string",
-                   enum: ["postgresql", "mysql"],
-                   description: "Database type to test"
+                   enum: ["mysql"],
+                   description: "Database type to test (MySQL only)"
                  },
                  testType: {
                    type: "string",
@@ -900,8 +901,8 @@ class OpenShiftMCPServer {
         }
         break;
       case 'run_database_benchmark':
-        if (!args.dbType || !['postgresql', 'mysql'].includes(args.dbType)) {
-          throw new Error('dbType is required and must be postgresql or mysql');
+        if (!args.dbType || args.dbType !== 'mysql') {
+          throw new Error('dbType is required and must be mysql');
         }
         break;
     }
@@ -1821,9 +1822,9 @@ class OpenShiftMCPServer {
           if (needsRemoteAccess) {
             const sshHost = process.env.MCP_BASTION_HOST;
             const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
-            const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
             statusFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${statusCommand.replace(/"/g, '\\"')}\\""`; 
-          } else {
+        } else {
             statusFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${statusCommand}"`;
           }
           
@@ -1840,9 +1841,9 @@ class OpenShiftMCPServer {
           if (needsRemoteAccess) {
             const sshHost = process.env.MCP_BASTION_HOST;
             const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
-            const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
             logsFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${logsCommand.replace(/"/g, '\\"')}\\""`; 
-          } else {
+        } else {
             logsFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${logsCommand}"`;
           }
           
@@ -1851,37 +1852,37 @@ class OpenShiftMCPServer {
             timeout: 120000  // 2 minutes for oc debug pod creation
           });
           
-          const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
-          
-          // Parse logs for errors and warnings
-          for (const line of logLines) {
-            if (line.toLowerCase().includes('error') || 
-                line.toLowerCase().includes('failed') ||
-                line.toLowerCase().includes('warn')) {
+        const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
+        
+        // Parse logs for errors and warnings
+        for (const line of logLines) {
+          if (line.toLowerCase().includes('error') || 
+              line.toLowerCase().includes('failed') ||
+              line.toLowerCase().includes('warn')) {
               allKubeletLogs.push({
                 node: nodeName,
-                timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
-                level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
-                message: line
-              });
-            }
+              timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
+              level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
+              message: line
+            });
           }
-          
+        }
+        
           // If system errors are requested, check for broader system issues on this node
-          if (includeSystemErrors) {
+        if (includeSystemErrors) {
             const systemCommand = `journalctl --since="-${hoursBack}h" --lines=20 --no-pager | grep -i 'systemd\\|kernel\\|oom'`;
             let systemFullCommand;
             
             if (needsRemoteAccess) {
               const sshHost = process.env.MCP_BASTION_HOST;
               const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
-              const sshUser = process.env.MCP_BASTION_USER || 'root';
+            const sshUser = process.env.MCP_BASTION_USER || 'root';
               systemFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${systemCommand.replace(/"/g, '\\"')}\\""`; 
-            } else {
+          } else {
               systemFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${systemCommand}"`;
-            }
-            
-            try {
+          }
+          
+          try {
               const systemResult = await promisifiedExec(systemFullCommand, { 
                 maxBuffer: 1024 * 1024 * 5, 
                 timeout: 120000
@@ -1893,7 +1894,7 @@ class OpenShiftMCPServer {
                   message: line
                 });
               }
-            } catch (systemError) {
+          } catch (systemError) {
               console.error(`Could not retrieve system errors from node ${nodeName}:`, systemError.message);
             }
           }
@@ -1902,10 +1903,10 @@ class OpenShiftMCPServer {
           allKubeletStatus[nodeName] = 'inaccessible';
           allKubeletLogs.push({
             node: nodeName,
-            timestamp: new Date().toISOString(),
-            level: 'error',
+          timestamp: new Date().toISOString(),
+          level: 'error',
             message: `Cannot access kubelet service on node ${nodeName}: ${nodeError.message}`
-          });
+        });
         }
       }
       
@@ -1973,9 +1974,9 @@ class OpenShiftMCPServer {
           if (needsRemoteAccess) {
             const sshHost = process.env.MCP_BASTION_HOST;
             const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
-            const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
             statusFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${statusCommand.replace(/"/g, '\\"')}\\""`; 
-          } else {
+        } else {
             statusFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${statusCommand}"`;
           }
           
@@ -1992,9 +1993,9 @@ class OpenShiftMCPServer {
           if (needsRemoteAccess) {
             const sshHost = process.env.MCP_BASTION_HOST;
             const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
-            const sshUser = process.env.MCP_BASTION_USER || 'root';
+          const sshUser = process.env.MCP_BASTION_USER || 'root';
             logsFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${logsCommand.replace(/"/g, '\\"')}\\""`; 
-          } else {
+        } else {
             logsFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${logsCommand}"`;
           }
           
@@ -2003,37 +2004,37 @@ class OpenShiftMCPServer {
             timeout: 120000  // 2 minutes for oc debug pod creation
           });
           
-          const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
-          
+        const logLines = logsResult.stdout.split('\n').filter(line => line.trim());
+        
           // Parse logs for errors and warnings
-          for (const line of logLines) {
-            if (line.toLowerCase().includes('error') || 
-                line.toLowerCase().includes('failed') ||
-                line.toLowerCase().includes('warn')) {
+        for (const line of logLines) {
+          if (line.toLowerCase().includes('error') || 
+              line.toLowerCase().includes('failed') ||
+              line.toLowerCase().includes('warn')) {
               allCrioLogs.push({
                 node: nodeName,
-                timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
-                level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
-                message: line
-              });
-            }
+              timestamp: line.match(/^\w+ \d+ \d+:\d+:\d+/) ? line.match(/^\w+ \d+ \d+:\d+:\d+/)[0] : 'unknown',
+              level: line.toLowerCase().includes('error') || line.toLowerCase().includes('failed') ? 'error' : 'warning',
+              message: line
+            });
           }
-          
+        }
+        
           // If container errors are requested, check for container-specific issues on this node
-          if (includeContainerErrors) {
+        if (includeContainerErrors) {
             const containerCommand = `journalctl --since="-${hoursBack}h" --lines=30 --no-pager | grep -i 'container\\|pod\\|image'`;
             let containerFullCommand;
             
             if (needsRemoteAccess) {
               const sshHost = process.env.MCP_BASTION_HOST;
               const sshKey = process.env.MCP_SSH_KEY || '/home/nchhabra/.ssh/id_rsa';
-              const sshUser = process.env.MCP_BASTION_USER || 'root';
+            const sshUser = process.env.MCP_BASTION_USER || 'root';
               containerFullCommand = `ssh -i ${sshKey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ${sshUser}@${sshHost} "cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c \\"${containerCommand.replace(/"/g, '\\"')}\\""`; 
-            } else {
+          } else {
               containerFullCommand = `cd /opt/openshift-mcp-server && KUBECONFIG=${kubeconfigPath} timeout 90s oc debug node/${nodeName} -- chroot /host bash -c "${containerCommand}"`;
-            }
-            
-            try {
+          }
+          
+          try {
               const containerResult = await promisifiedExec(containerFullCommand, { 
                 maxBuffer: 1024 * 1024 * 5, 
                 timeout: 120000
@@ -2047,7 +2048,7 @@ class OpenShiftMCPServer {
                   });
                 }
               }
-            } catch (containerError) {
+          } catch (containerError) {
               console.error(`Could not retrieve container errors from node ${nodeName}:`, containerError.message);
             }
           }
@@ -2056,10 +2057,10 @@ class OpenShiftMCPServer {
           allCrioStatus[nodeName] = 'inaccessible';
           allCrioLogs.push({
             node: nodeName,
-            timestamp: new Date().toISOString(),
-            level: 'error',
+          timestamp: new Date().toISOString(),
+          level: 'error',
             message: `Cannot access CRI-O service on node ${nodeName}: ${nodeError.message}`
-          });
+        });
         }
       }
       
@@ -2464,7 +2465,7 @@ ${ports.map(port => `        - containerPort: ${port.containerPort}
       try {
         await appsApi.readNamespacedDeployment({name: targetDeployment, namespace});
       } catch (error) {
-        throw new Error(`Deployment "${targetDeployment}" not found in namespace "${namespace}"`);
+          throw new Error(`Deployment "${targetDeployment}" not found in namespace "${namespace}"`);
       }
 
       const hpa = {
@@ -3159,107 +3160,17 @@ spec:
         await this.k8sApi.readNamespace({name: testNamespace});
       } catch (error) {
         if (error.code === 404 || error.response?.statusCode === 404) {
-          const namespaceObject = {
-            metadata: { name: testNamespace }
-          };
+        const namespaceObject = {
+          metadata: { name: testNamespace }
+        };
           await this.k8sApi.createNamespace({body: namespaceObject});
         } else {
           throw error;
         }
       }
 
-      // Create directory on node for local-storage
-      const testPath = '/tmp/fio-test-data';
-      const promisifiedExec = promisify(exec);
-      const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
-      
-      try {
-        let mkdirCmd;
-        if (useRemoteAccess) {
-          const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-          const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-          const sshUser = process.env.MCP_BASTION_USER || 'root';
-          const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-          
-          // Get first node name
-          const nodeCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl get nodes -o jsonpath='{.items[0].metadata.name}'"`;
-          const nodeResult = await promisifiedExec(nodeCmd);
-          const nodeName = nodeResult.stdout.trim();
-          
-          // Create directory on node using oc debug
-          mkdirCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} oc debug node/${nodeName} -- chroot /host mkdir -p ${testPath}"`;
-        } else {
-          const nodeResult = await promisifiedExec('kubectl get nodes -o jsonpath=\'{.items[0].metadata.name}\'');
-          const nodeName = nodeResult.stdout.trim();
-          mkdirCmd = `oc debug node/${nodeName} -- chroot /host mkdir -p ${testPath}`;
-        }
-        await promisifiedExec(mkdirCmd);
-      } catch (mkdirError) {
-        console.error('Directory creation warning:', mkdirError.message);
-      }
-
-      // Create PV for local-storage testing
-      const pvName = `fio-pv-${Date.now()}`;
-      const pv = {
-        metadata: {
-          name: pvName
-        },
-        spec: {
-          capacity: {
-            storage: volumeSize
-          },
-          volumeMode: 'Filesystem',
-          accessModes: ['ReadWriteOnce'],
-          persistentVolumeReclaimPolicy: 'Delete',
-          storageClassName: storageClass || 'local-storage',
-          local: {
-            path: testPath
-          },
-          nodeAffinity: {
-            required: {
-              nodeSelectorTerms: [
-                {
-                  matchExpressions: [
-                    {
-                      key: 'kubernetes.io/hostname',
-                      operator: 'Exists'
-                    }
-                  ]
-                }
-              ]
-            }
-          }
-        }
-      };
-
-      // Create PV
-      try {
-        await this.k8sApi.createPersistentVolume({body: pv});
-      } catch (pvError) {
-        if (pvError.code !== 409) { // Ignore if already exists
-          console.error('PV creation warning:', pvError.message);
-        }
-      }
-
-      // Create PVC for testing
-      const pvcName = `fio-test-${Date.now()}`;
-      const pvc = {
-        metadata: {
-          name: pvcName
-        },
-        spec: {
-          accessModes: ['ReadWriteOnce'],
-          resources: {
-            requests: {
-              storage: volumeSize
-            }
-          },
-          ...(storageClass && { storageClassName: storageClass })
-        }
-      };
-
-      // Create PVC using K8s API
-      const pvcResult = await this.k8sApi.createNamespacedPersistentVolumeClaim({namespace: testNamespace, body: pvc});
+      // Use emptyDir for FIO testing (simpler, no storage class dependencies)
+      // This provides in-memory or node-local storage perfect for I/O testing
 
       // Map test types to FIO rw parameter
       const fioRwMap = {
@@ -3283,8 +3194,8 @@ spec:
                 {
                   name: 'fio',
                   image: 'quay.io/openshift/origin-tests:latest',
-                  command: ['fio'],
-                  args: ['--name=test', `--rw=${fioRw}`, `--bs=${blockSize}`, `--runtime=${duration}`, '--ioengine=sync', '--filename=/data/testfile', '--size=100M'],
+                  command: ['sh', '-c'],
+                  args: [`echo "Starting FIO test..." && fio --name=test --rw=${fioRw} --bs=${blockSize} --runtime=${duration} --time_based --ioengine=sync --filename=/data/testfile --size=100M --output-format=normal && echo "FIO test completed"`],
                   volumeMounts: [
                     {
                       name: 'test-data',
@@ -3296,9 +3207,7 @@ spec:
               volumes: [
                 {
                   name: 'test-data',
-                  persistentVolumeClaim: {
-                    claimName: pvcName
-                  }
+                  emptyDir: {}
                 }
               ],
               restartPolicy: 'Never'
@@ -3313,11 +3222,38 @@ spec:
       const jobResult = await batchApi.createNamespacedJob({namespace: testNamespace, body: job});
       const jobName = jobResult.body?.metadata?.name || jobResult.metadata?.name || job.metadata.name;
 
-      // Wait for job completion (simplified - in production, use proper polling)
+      // Wait for pod to be created and PVC to bind (up to 60 seconds)
+      let podStarted = false;
+      for (let i = 0; i < 60; i++) {
+        try {
+          const podsCheck = await this.k8sApi.listNamespacedPod({
+            namespace: testNamespace,
+            labelSelector: `job-name=${jobName}`
+          });
+          const pods = podsCheck.body?.items || podsCheck.items || [];
+          if (pods.length > 0) {
+            const podPhase = pods[0].status?.phase;
+            if (podPhase === 'Running' || podPhase === 'Succeeded' || podPhase === 'Failed') {
+              podStarted = true;
+              break;
+            }
+          }
+        } catch (checkError) {
+          // Pod not found yet, continue waiting
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+      }
+
+      // Wait for job completion
+      let logs = '';
+      if (!podStarted) {
+        logs = 'Warning: Pod never started (likely PVC binding issue). Check PV/PVC status.';
+      }
+      
       await new Promise(resolve => setTimeout(resolve, parseInt(duration) * 1000 + 30000));
 
-      // Get job logs using Log API
-      let logs = '';
+      // Get job logs using K8s Log API with proper stream handling
+      if (!logs) { // Only retrieve logs if we don't have a warning message
       try {
         // Get pods for the job
         const podsResponse = await this.k8sApi.listNamespacedPod({
@@ -3329,24 +3265,97 @@ spec:
         if (items.length > 0) {
           const podName = items[0].metadata.name;
           
-          // Use Log API which returns plain text, not JSON
-          const logApi = this.kubeConfig.makeApiClient(k8s.Log);
+          // Use the Log API which is designed for plain text logs
+          const logApi = new k8s.Log(this.kubeConfig);
+          
+          // Declare these outside try block for use in catch
+          let phase = 'Unknown';
+          let containerInfo = 'Unknown';
+          
           try {
-            logs = await logApi.log(testNamespace, podName, undefined, {
+            // Check pod status first
+            const podDetails = await this.k8sApi.readNamespacedPod({
+              name: podName,
+              namespace: testNamespace
+            });
+            const podStatus = podDetails.body?.status || podDetails.status;
+            phase = podStatus?.phase || 'Unknown';
+            const containerStatuses = podStatus?.containerStatuses || [];
+            
+            // Get container state information
+            if (containerStatuses.length > 0) {
+              const container = containerStatuses[0];
+              const state = container.state;
+              if (state.waiting) {
+                containerInfo = `Waiting: ${state.waiting.reason || 'Unknown'}`;
+              } else if (state.running) {
+                containerInfo = 'Running';
+              } else if (state.terminated) {
+                containerInfo = `Terminated: exitCode=${state.terminated.exitCode}, reason=${state.terminated.reason || 'Unknown'}`;
+              }
+            }
+            
+            // Wait for pod to complete if still running
+            if (phase === 'Running' || phase === 'Pending') {
+              await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 more seconds
+            }
+            
+            // The log() method with a writable stream to capture output
+            const chunks = [];
+            
+            const logStream = new Writable({
+              write(chunk, encoding, callback) {
+                chunks.push(chunk);
+                callback();
+              }
+            });
+            
+            await logApi.log(testNamespace, podName, '', logStream, {
               follow: false,
               tailLines: 1000,
               pretty: false,
               timestamps: false
             });
+            
+            // Combine all chunks into final log string
+            if (chunks.length > 0) {
+              logs = Buffer.concat(chunks).toString('utf-8');
+            } else {
+              logs = `No logs from API (Pod phase: ${phase}, Container: ${containerInfo})`;
+            }
           } catch (logError) {
-            // Fallback: try direct API call
-            const logResponse = await this.k8sApi.readNamespacedPodLog({
-              name: podName, 
-              namespace: testNamespace,
-              container: undefined
-            });
-            logs = typeof logResponse === 'string' ? logResponse : 
-                   (logResponse.body ? String(logResponse.body) : 'Log format not recognized');
+            // Handle HTTP 204 (No Content) - means logs are empty but request was successful
+            if (logError.message && logError.message.includes('HTTP-Code: 204')) {
+              logs = `Pod completed (phase: ${phase}, Container: ${containerInfo}), but produced no logs via API`;
+            } else {
+              logs = `Failed to retrieve logs via API (phase: ${phase}, Container: ${containerInfo}): ${logError.message}`;
+            }
+          }
+          
+          // If we got no logs from K8s API, try kubectl as fallback
+          if (!logs || logs.includes('No logs') || logs.includes('but produced no logs')) {
+            try {
+              const promisifiedExec = promisify(exec);
+              const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+              let kubectlLogsCmd;
+              
+      if (useRemoteAccess) {
+        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
+        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
+        const sshUser = process.env.MCP_BASTION_USER || 'root';
+        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
+                kubectlLogsCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "KUBECONFIG=${kubeconfig} kubectl logs ${podName} -n ${testNamespace} --tail=1000"`;
+      } else {
+                kubectlLogsCmd = `kubectl logs ${podName} -n ${testNamespace} --tail=1000`;
+              }
+              
+              const kubectlResult = await promisifiedExec(kubectlLogsCmd);
+              if (kubectlResult.stdout && kubectlResult.stdout.length > 0) {
+                logs = kubectlResult.stdout;
+              }
+            } catch (kubectlError) {
+              logs += `\n[kubectl fallback also failed: ${kubectlError.message}]`;
+            }
           }
         } else {
           logs = 'No pods found for job';
@@ -3354,14 +3363,19 @@ spec:
       } catch (error) {
         logs = `Failed to retrieve logs: ${error.message}`;
       }
+      } // End if (!logs)
 
-      // Cleanup
-      try {
-        await batchApi.deleteNamespacedJob({name: jobName, namespace: testNamespace});
-        await this.k8sApi.deleteNamespacedPersistentVolumeClaim({name: pvcName, namespace: testNamespace});
-        await this.k8sApi.deletePersistentVolume({name: pvName});
-      } catch (cleanupError) {
-        console.error('Cleanup warning:', cleanupError.message);
+      // Cleanup - TEMPORARILY DISABLED for debugging
+      // Delete job after enough time to inspect logs
+      if (podStarted && logs && logs.length > 50) {
+        // Only cleanup if we got real logs
+        try {
+          await batchApi.deleteNamespacedJob({name: jobName, namespace: testNamespace, body: {propagationPolicy: 'Foreground'}});
+        } catch (cleanupError) {
+          console.error('Cleanup warning:', cleanupError.message);
+        }
+      } else {
+        logs += `\n\nNote: Job "${jobName}" not cleaned up for debugging. Pod started: ${podStarted}, Logs length: ${logs.length}`;
       }
 
       return {
@@ -3673,9 +3687,9 @@ spec:
         await this.k8sApi.readNamespace({name: testNamespace});
       } catch (error) {
         if (error.code === 404 || error.response?.statusCode === 404) {
-          const namespaceObject = {
-            metadata: { name: testNamespace }
-          };
+        const namespaceObject = {
+          metadata: { name: testNamespace }
+        };
           await this.k8sApi.createNamespace({body: namespaceObject});
         } else {
           throw error;
@@ -3754,7 +3768,7 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
       // Write YAML to temp file to avoid shell escaping issues
       const tmpFile = `/tmp/stress-test-job-${Date.now()}.yaml`;
       writeFileSync(tmpFile, jobYaml);
-      
+
       const promisifiedExec = promisify(exec);
       const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
       let kubectlCmd;
@@ -3776,7 +3790,14 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
       await promisifiedExec(kubectlCmd);
       
       // Clean up local temp file
-      unlinkSync(tmpFile);
+      try {
+        unlinkSync(tmpFile);
+      } catch (unlinkError) {
+        // Ignore ENOENT errors (file already deleted or never created)
+        if (unlinkError.code !== 'ENOENT') {
+          console.error('Warning: Failed to cleanup temp file:', unlinkError.message);
+        }
+      }
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
 
       // Wait for test completion
@@ -3881,9 +3902,9 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
         await this.k8sApi.readNamespace({name: testNamespace});
       } catch (error) {
         if (error.code === 404 || error.response?.statusCode === 404) {
-          const namespaceObject = {
-            metadata: { name: testNamespace }
-          };
+        const namespaceObject = {
+          metadata: { name: testNamespace }
+        };
           await this.k8sApi.createNamespace({body: namespaceObject});
         } else {
           throw error;
@@ -3893,121 +3914,189 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
       const durationSeconds = this.parseDuration(duration);
       const serviceName = `db-${dbType}-svc`;
       
-      // Deploy database server first
+      // Deploy database server first using K8s API
       const promisifiedExec = promisify(exec);
       const useRemoteAccess = process.env.MCP_REMOTE_KUBECONFIG || process.env.MCP_BASTION_HOST;
+
+      // Deploy database using K8s API (more reliable than kubectl with echo)
+      const appsApi = this.kubeConfig.makeApiClient(k8s.AppsV1Api);
+      const { appendFileSync } = await import('fs');
+      const debugLog = (msg) => {
+        try {
+          appendFileSync('/tmp/db-benchmark-debug.log', `${new Date().toISOString()} - ${msg}\n`);
+        } catch (e) {}
+      };
       
-      let dbDeploymentYaml, dbServiceYaml;
-      if (dbType === 'postgresql') {
-        dbDeploymentYaml = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: postgres-db
-  namespace: ${testNamespace}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: postgres-db
-  template:
-    metadata:
-      labels:
-        app: postgres-db
-    spec:
-      containers:
-      - name: postgres
-        image: postgres:13
-        env:
-        - name: POSTGRES_PASSWORD
-          value: postgres123
-        - name: POSTGRES_DB
-          value: postgres
-        ports:
-        - containerPort: 5432
-`;
-        dbServiceYaml = `apiVersion: v1
-kind: Service
-metadata:
-  name: ${serviceName}
-  namespace: ${testNamespace}
-spec:
-  selector:
-    app: postgres-db
-  ports:
-  - port: 5432
-    targetPort: 5432
-`;
-      } else if (dbType === 'mysql') {
-        dbDeploymentYaml = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mysql-db
-  namespace: ${testNamespace}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mysql-db
-  template:
-    metadata:
-      labels:
-        app: mysql-db
-    spec:
-      containers:
-      - name: mysql
-        image: mysql:8.0
-        env:
-        - name: MYSQL_ROOT_PASSWORD
-          value: mysql123
-        - name: MYSQL_DATABASE
-          value: test
-        ports:
-        - containerPort: 3306
-`;
-        dbServiceYaml = `apiVersion: v1
-kind: Service
-metadata:
-  name: ${serviceName}
-  namespace: ${testNamespace}
-spec:
-  selector:
-    app: mysql-db
-  ports:
-  - port: 3306
-    targetPort: 3306
-`;
-      } else {
-        throw new Error(`Unsupported database type: ${dbType}`);
-      }
-
-      // Deploy database
-      let kubectlDeployCmd, kubectlServiceCmd;
-      if (useRemoteAccess) {
-        const sshHost = process.env.MCP_BASTION_HOST || 'localhost';
-        const sshKey = process.env.MCP_SSH_KEY || '~/.ssh/id_rsa';
-        const sshUser = process.env.MCP_BASTION_USER || 'root';
-        const kubeconfig = process.env.MCP_REMOTE_KUBECONFIG || '/root/.kube/config';
-        kubectlDeployCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${dbDeploymentYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-        kubectlServiceCmd = `ssh -i ${sshKey} -o StrictHostKeyChecking=no ${sshUser}@${sshHost} "echo '${dbServiceYaml}' | KUBECONFIG=${kubeconfig} kubectl apply -f -"`;
-      } else {
-        kubectlDeployCmd = `echo '${dbDeploymentYaml}' | kubectl apply -f -`;
-        kubectlServiceCmd = `echo '${dbServiceYaml}' | kubectl apply -f -`;
-      }
-
-      await promisifiedExec(kubectlDeployCmd);
-      await promisifiedExec(kubectlServiceCmd);
-
-      // Wait for database to be ready (60 seconds)
-      await new Promise(resolve => setTimeout(resolve, 60000));
+      debugLog(`Starting database deployment for ${dbType}`);
       
-      let benchmarkCommand;
-      if (dbType === 'postgresql') {
-        const pgCmd = `sleep 5 && PGPASSWORD=postgres123 pgbench -h ${serviceName} -p 5432 -U postgres -c ${threads} -j ${Math.min(threads, 4)} -T ${durationSeconds} -i postgres && PGPASSWORD=postgres123 pgbench -h ${serviceName} -p 5432 -U postgres -c ${threads} -j ${Math.min(threads, 4)} -T ${durationSeconds} postgres`;
-        benchmarkCommand = ['sh', '-c', pgCmd];
-      } else if (dbType === 'mysql') {
-        const mysqlCmd = `sleep 10 && sysbench oltp_${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} prepare && sysbench oltp_${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} run`;
-        benchmarkCommand = ['sh', '-c', mysqlCmd];
+      let dbDeployment, dbService;
+      if (dbType === 'mysql') {
+        dbDeployment = {
+          metadata: {
+            name: 'mysql-db',
+            namespace: testNamespace
+          },
+          spec: {
+            replicas: 1,
+            selector: {
+              matchLabels: {
+                app: 'mysql-db'
+              }
+            },
+            template: {
+              metadata: {
+                labels: {
+                  app: 'mysql-db'
+                }
+              },
+              spec: {
+                containers: [
+                  {
+                    name: 'mysql',
+                    image: 'mysql:8.0',
+                    env: [
+                      { name: 'MYSQL_ROOT_PASSWORD', value: 'mysql123' },
+                      { name: 'MYSQL_DATABASE', value: 'test' }
+                    ],
+                    ports: [{ containerPort: 3306 }],
+                    readinessProbe: {
+                      tcpSocket: {
+                        port: 3306
+                      },
+                      initialDelaySeconds: 15,
+                      periodSeconds: 5,
+                      timeoutSeconds: 3,
+                      failureThreshold: 5
+                    },
+                    livenessProbe: {
+                      tcpSocket: {
+                        port: 3306
+                      },
+                      initialDelaySeconds: 60,
+                      periodSeconds: 10,
+                      timeoutSeconds: 5,
+                      failureThreshold: 6
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        };
+        
+        dbService = {
+          metadata: {
+            name: serviceName,
+            namespace: testNamespace
+          },
+          spec: {
+            selector: {
+              app: 'mysql-db'
+            },
+            ports: [{
+              port: 3306,
+              targetPort: 3306
+            }]
+          }
+        };
       }
+
+      // Create deployment and service using K8s API (or use existing if already exists)
+      debugLog(`About to create deployment: ${dbDeployment.metadata.name}`);
+      try {
+        const deployResult = await appsApi.createNamespacedDeployment({namespace: testNamespace, body: dbDeployment});
+        debugLog(`Created ${dbType} deployment successfully`);
+      } catch (deployError) {
+        debugLog(`Deployment creation error: ${deployError.message}, code: ${deployError.code}`);
+        if (deployError.code === 409) {
+          debugLog(`${dbType} deployment already exists, reusing it`);
+      } else {
+          debugLog(`FATAL: Failed to create ${dbType} deployment`);
+          throw new Error(`Database deployment failed: ${deployError.message}`);
+        }
+      }
+      
+      debugLog(`About to create service: ${serviceName}`);
+      try {
+        const svcResult = await this.k8sApi.createNamespacedService({namespace: testNamespace, body: dbService});
+        debugLog(`Created ${dbType} service successfully`);
+      } catch (svcError) {
+        debugLog(`Service creation error: ${svcError.message}, code: ${svcError.code}`);
+        if (svcError.code === 409) {
+          debugLog(`${dbType} service already exists, reusing it`);
+        } else {
+          debugLog(`FATAL: Failed to create ${dbType} service`);
+          throw new Error(`Database service creation failed: ${svcError.message}`);
+        }
+      }
+      
+      debugLog('Verifying deployment exists...');
+      // Verify deployment exists and has pods starting
+      try {
+        const deployStatus = await appsApi.readNamespacedDeployment({
+          name: dbDeployment.metadata.name,
+          namespace: testNamespace
+        });
+        debugLog(`${dbType} deployment verified, replicas: ${deployStatus.spec?.replicas}`);
+      } catch (readError) {
+        debugLog(`FATAL: Deployment verification failed: ${readError.message}`);
+        throw new Error(`Database deployment verification failed: ${readError.message}`);
+      }
+
+      // Wait for database pod to be ready (check pod status instead of fixed wait)
+      debugLog('Waiting for database pod to be ready...');
+      const dbDeploymentName = 'mysql-db';
+      let dbReady = false;
+      const maxWaitTime = 120; // 2 minutes for MySQL
+      
+      for (let i = 0; i < maxWaitTime; i++) {
+        try {
+          const podsResponse = await this.k8sApi.listNamespacedPod({
+            namespace: testNamespace,
+            labelSelector: `app=${dbDeploymentName}`
+          });
+          const pods = podsResponse.body?.items || podsResponse.items || [];
+          
+          if (pods.length > 0) {
+            const pod = pods[0];
+            const podPhase = pod.status?.phase;
+            const containerStatuses = pod.status?.containerStatuses || [];
+            
+            if (containerStatuses.length > 0) {
+              const containerReady = containerStatuses[0].ready;
+              const containerState = containerStatuses[0].state;
+              debugLog(`Pod ${pod.metadata.name} phase: ${podPhase}, ready: ${containerReady}, state: ${JSON.stringify(containerState)}`);
+              
+              if (podPhase === 'Running' && containerReady === true) {
+                debugLog(`Database pod is READY after ${i} seconds!`);
+                dbReady = true;
+                break;
+              }
+            } else {
+              debugLog(`Pod ${pod.metadata.name} phase: ${podPhase}, NO container statuses yet`);
+            }
+          } else {
+            if (i % 10 === 0) { // Log every 10 seconds to avoid spam
+              debugLog(`No pods found with label app=${dbDeploymentName} (waited ${i}s)`);
+            }
+          }
+        } catch (checkError) {
+          debugLog(`Pod check error: ${checkError.message}`);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between checks
+      }
+      
+      if (!dbReady) {
+        debugLog(`WARNING: Database pod not ready after ${maxWaitTime} seconds, proceeding anyway`);
+      }
+      
+      // Give database a few more seconds to be fully ready for connections
+      await new Promise(resolve => setTimeout(resolve, 10000));
+      
+      // MySQL benchmark command
+      const mysqlCmd = `sleep 10 && sysbench ${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} prepare && sysbench ${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} run`;
+      const benchmarkCommand = ['sh', '-c', mysqlCmd];
 
       const job = {
         apiVersion: 'batch/v1',
@@ -4022,7 +4111,7 @@ spec:
               containers: [
                 {
                   name: 'benchmark',
-                  image: dbType === 'postgresql' ? 'postgres:13' : 'perconalab/sysbench',
+                  image: 'perconalab/sysbench',
                   command: benchmarkCommand
                 }
               ],
@@ -4086,7 +4175,14 @@ ${commandYaml}
       await promisifiedExec(kubectlCmd);
       
       // Clean up local temp file
-      unlinkSync(tmpFile);
+      try {
+        unlinkSync(tmpFile);
+      } catch (unlinkError) {
+        // Ignore ENOENT errors (file already deleted or never created)
+        if (unlinkError.code !== 'ENOENT') {
+          console.error('Warning: Failed to cleanup temp file:', unlinkError.message);
+        }
+      }
       
       const batchApi = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
 
@@ -4112,8 +4208,7 @@ ${commandYaml}
         
         // Clean up database deployment and service
         const appsApi = this.kubeConfig.makeApiClient(k8s.AppsV1Api);
-        const dbDeploymentName = dbType === 'postgresql' ? 'postgres-db' : 'mysql-db';
-        await appsApi.deleteNamespacedDeployment({name: dbDeploymentName, namespace: testNamespace});
+        await appsApi.deleteNamespacedDeployment({name: 'mysql-db', namespace: testNamespace});
         await this.k8sApi.deleteNamespacedService({name: serviceName, namespace: testNamespace});
       } catch (cleanupError) {
         console.error('Cleanup warning:', cleanupError.message);
