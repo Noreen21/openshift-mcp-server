@@ -1,29 +1,14 @@
-# Kube-Burner Performance Testing Integration Example
+# Kube-Burner Performance Testing Guide
 
-This document provides a comprehensive example of how to use the enhanced OpenShift MCP Server kube-burner integration for performance testing directly from your AI Code Assistant.
+This document provides practical guidance and advanced examples for using kube-burner cluster density testing through the OpenShift MCP Server.
 
-## What is Kube-Burner?
+## Overview
 
-Kube-Burner is a performance testing tool specifically designed for OpenShift and Kubernetes clusters. Our MCP Server provides a simplified kube-burner-style implementation that provides:
-- **Load Testing**: Simulate various workload patterns with pod density testing
+Kube-burner tests measure cluster performance under load by creating pods at scale:
+- **Load Testing**: Simulate various workload patterns
 - **Performance Benchmarking**: Measure cluster performance under different conditions
 - **Cluster Density Testing**: Validate scheduler and resource management capabilities
-- **Creation & Cleanup Operations**: Flexible workload lifecycle management
-
-## Enhanced Features
-
-### ✅ **Fixed Implementation**
-- **Syntax Error Free**: All kubectl syntax issues resolved
-- **YAML-Based Pod Creation**: Uses proper Kubernetes manifests instead of deprecated flags
-- **Reliable Execution**: Improved error handling and validation
-- **Operation Control**: Support for creation-only, cleanup-only, or both operations
-
-### 🚀 **New Capabilities**
-- **Flexible Operations**: `create`, `cleanup`, or `both` operation modes
-- **Resource Specifications**: Proper CPU/memory requests and limits
-- **Namespace Management**: Automatic namespace creation and cleanup
-- **Performance Metrics**: Pod creation rates and execution timing
-- **Node Distribution**: Detailed pod scheduling analysis
+- **Flexible Operations**: Create, cleanup, or full cycle testing
 
 ## Available Test Types
 
@@ -192,74 +177,12 @@ kubectl describe quota -n <namespace>
 - Reduce iteration counts for slower environments
 - Monitor node resource availability
 
-#### 3. YAML Syntax Errors
-- Fixed in current implementation
-- Uses proper Kubernetes YAML manifests
-- No deprecated kubectl flags
-
-#### 4. Namespace Cleanup Issues
+#### 3. Namespace Cleanup Issues
 ```bash
 # Force delete namespace if stuck
 kubectl delete namespace <namespace> --force --grace-period=0
 ```
 
-## Configuration Examples
-
-### MCP Tool Configuration
-```javascript
-// Cluster density test with creation only
-{
-  "method": "tools/call",
-  "params": {
-    "name": "run_kube_burner",
-    "arguments": {
-      "testType": "cluster-density-v2",
-      "iterations": 8,
-      "namespace": "cluster-density-test",
-      "operation": "create",
-      "cleanup": false,
-      "timeout": "10m"
-    }
-  }
-}
-
-// Cleanup existing test namespace
-{
-  "method": "tools/call",
-  "params": {
-    "name": "run_kube_burner",
-    "arguments": {
-      "testType": "cluster-density-v2",
-      "namespace": "cluster-density-test",
-      "operation": "cleanup"
-    }
-  }
-}
-
-// Full cycle test with automatic cleanup
-{
-  "method": "tools/call",
-  "params": {
-    "name": "run_kube_burner",
-    "arguments": {
-      "testType": "node-density",
-      "iterations": 5,
-      "namespace": "node-density-test",
-      "operation": "both",
-      "timeout": "15m"
-    }
-  }
-}
-```
-
-### Environment Variables
-```bash
-export KUBECONFIG=/path/to/kubeconfig
-export MCP_BASTION_HOST=bastion.example.com
-export MCP_BASTION_USER=admin
-export MCP_SSH_KEY=~/.ssh/id_rsa
-export MCP_REMOTE_KUBECONFIG=/root/.kube/config
-```
 
 ## Performance Analysis
 
@@ -282,30 +205,6 @@ kubectl top pods -n <namespace>
 kubectl get pods -n <namespace> --no-headers | awk '{print $3}' | sort | uniq -c
 ```
 
-## Integration Benefits
-
-✅ **Syntax Error Free** - Resolved all kubectl compatibility issues  
-✅ **Flexible Operations** - Support for creation-only, cleanup-only, or full cycle  
-✅ **YAML-Based Creation** - Uses proper Kubernetes manifests for reliability  
-✅ **Resource Management** - Built-in CPU/memory limits and requests  
-✅ **Performance Metrics** - Detailed timing and resource usage analysis  
-✅ **Production Ready** - Suitable for SNO and multi-node environments  
-✅ **Namespace Management** - Automatic namespace creation and cleanup  
-✅ **Error Handling** - Comprehensive error handling and validation  
-
-## Migration from Old Implementation
-
-### What's Changed
-1. **Fixed kubectl syntax** - No more `--requests` flag errors
-2. **YAML manifests** - Proper pod creation using Kubernetes YAML
-3. **Operation modes** - Flexible creation/cleanup control
-4. **Better error handling** - Comprehensive validation and error reporting
-5. **Performance tracking** - Built-in timing and metrics collection
-
-### Backward Compatibility
-- All existing test types supported
-- Same parameter names and defaults
-- Enhanced with new operation control features
 
 ## Related Links
 

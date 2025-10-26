@@ -59,7 +59,7 @@ class OpenShiftMCPServer {
     const kc = new k8s.KubeConfig();
     
     try {
-      // Enhanced loading for private clusters
+      // Support for remote/private clusters
       if (process.env.MCP_REMOTE_KUBECONFIG) {
         console.error(`Loading kubeconfig from MCP_REMOTE_KUBECONFIG: ${process.env.MCP_REMOTE_KUBECONFIG}`);
         kc.loadFromFile(process.env.MCP_REMOTE_KUBECONFIG);

@@ -1,6 +1,6 @@
 # OpenShift MCP Server
 
-A Model Context Protocol (MCP) server for monitoring and managing OpenShift/Kubernetes clusters. This server provides real-time cluster insights through AI chatbots, enabling natural language queries about your cluster health, performance, and resource usage.
+A Model Context Protocol (MCP) server for monitoring and managing OpenShift/Kubernetes clusters. This server provides real-time cluster insights through AI assistants, enabling natural language queries about your cluster health, performance, and resource usage.
 
 ## Features
 
@@ -31,7 +31,7 @@ A Model Context Protocol (MCP) server for monitoring and managing OpenShift/Kube
 - **Bastion Host Support**: Execute tests on private clusters through jump hosts
 - **SSH Integration**: Secure remote command execution with credential management
 - **Multi-Cluster Testing**: Test across different OpenShift environments
-- **Automated Benchmarking**: Schedule and run performance tests through AI chatbots
+- **Automated Benchmarking**: Schedule and run performance tests through AI assistants
 - **Remote Execution**: Execute performance benchmarks and tools on remote clusters through bastion hosts
 - **Multi-Cluster Support**: Manage and test across different OpenShift environments
 
@@ -72,7 +72,7 @@ For remote cluster access through bastion hosts, you can use either SSH key (rec
    export MCP_BASTION_HOST="your-bastion-host.com"
    export MCP_BASTION_USER="your-username"
    export MCP_SSH_KEY="~/.ssh/id_rsa_bastion"
-   export MCP_REMOTE_PATH="/opt/cursor-kube-mcp-server"
+   export MCP_REMOTE_PATH="/opt/openshift-mcp-server"
    export MCP_REMOTE_KUBECONFIG="/path/to/remote/kubeconfig"
    export MCP_REMOTE_NODE_ENV="production"
    ```
@@ -98,26 +98,25 @@ For environments where SSH keys are not feasible:
    export MCP_BASTION_HOST="your-bastion-host.com"
    export MCP_BASTION_USER="your-username"
    export MCP_BASTION_PASSWORD="your-secure-password"
-   export MCP_REMOTE_PATH="/opt/cursor-kube-mcp-server"
+   export MCP_REMOTE_PATH="/opt/openshift-mcp-server"
    export MCP_REMOTE_KUBECONFIG="/path/to/remote/kubeconfig"
    export MCP_REMOTE_NODE_ENV="production"
    ```
 
 **Security Note**: SSH key authentication is strongly recommended over password authentication for better security. Password authentication should only be used when SSH keys are not available.
 
-#### Enhanced Remote Launcher Features
+#### Remote Launcher Features
 
-The `simple-remote-launcher.js` provides comprehensive functionality:
+The `remote-launcher.js` provides comprehensive functionality:
 
 - ✅ **Automatic Configuration Validation** - Validates all required environment variables
 - ✅ **Pre-Flight Connectivity Testing** - Tests SSH connection before launching MCP server
 - ✅ **Dual Authentication Support** - SSH key (recommended) and password authentication
-- ✅ **Cross-Platform Compatibility** - Works on Windows, Linux, and macOS
+- ✅ **Linux Support** - Tested and validated on Linux environments
 - ✅ **Robust Error Handling** - Detailed error messages and troubleshooting guidance
 - ✅ **Graceful Shutdown** - Proper signal handling and resource cleanup
 - ✅ **SSH Keep-Alive** - Automatic connection maintenance for stability
-- ✅ **Colored Output** - Clear status messages with color coding
-- ✅ **Enhanced Security** - Protection against command injection attacks
+- ✅ **Sensitive Data Protection** - Automatic redaction of tokens and credentials from logs
 
 ### Phase 2: Remote MCP Server Setup
 
@@ -160,12 +159,12 @@ This script will:
 After successful setup, test the remote MCP server connection:
 
 ```bash
-node ./scripts/simple-remote-launcher.js
+node ./scripts/remote-launcher.js
 ```
 You may run the script using the following options:
 
 ```bash
-Usage: simple-remote-launcher.js [options]
+Usage: remote-launcher.js [options]
 
 Options:
   -H, --host <host>           Bastion host address
@@ -188,18 +187,18 @@ Environment Variables (used as defaults):
 
 Examples:
   # Using CLI arguments only
-  ./scripts/simple-remote-launcher.js -H bastion.example.com -U root -s ~/.ssh/id_rsa -k /path/to/kubeconfig -p /opt/mcp-server
+  ./scripts/remote-launcher.js -H bastion.example.com -U root -s ~/.ssh/id_rsa -k /path/to/kubeconfig -p /opt/mcp-server
 
   # Using environment variables (backward compatible)
   export MCP_BASTION_HOST=bastion.example.com
-  ./scripts/simple-remote-launcher.js
+  ./scripts/remote-launcher.js
 
   # Mixed: CLI args override env vars
   export MCP_BASTION_HOST=bastion.example.com
-  ./scripts/simple-remote-launcher.js -U admin -k /custom/kubeconfig
+  ./scripts/remote-launcher.js -U admin -k /custom/kubeconfig
 ```
 
-This enhanced launcher will:
+This launcher will:
 - Validate configuration and test connectivity
 - Connect to the bastion host via SSH (key or password auth)
 - Start the MCP server remotely with robust error handling
@@ -208,19 +207,19 @@ This enhanced launcher will:
 
 #### Step 3: Configure AI Code Assistant
 
-Update your AI Code Assistant MCP configuration to use the enhanced remote launcher:
+Update your AI Code Assistant MCP configuration to use the remote launcher:
 
 ```json
 {
   "mcpServers": {
     "openshift-mcp-server": {
       "command": "node",
-      "args": ["/path/to/openshift-mcp-server/simple-remote-launcher.js"],
+      "args": ["/path/to/openshift-mcp-server/remote-launcher.js"],
       "env": {
         "MCP_BASTION_HOST": "your-bastion-host.com",
         "MCP_BASTION_USER": "your-username",
         "MCP_SSH_KEY": "/path/to/your/ssh/key",
-        "MCP_REMOTE_PATH": "/opt/cursor-kube-mcp-server",
+        "MCP_REMOTE_PATH": "/opt/openshift-mcp-server",
         "MCP_REMOTE_KUBECONFIG": "/path/to/remote/kubeconfig",
         "MCP_REMOTE_NODE_ENV": "production"
       },
@@ -336,7 +335,6 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
 #### Deployment & Configuration Management
 - *"Create a new deployment with guaranteed QoS using 4 CPU cores in namespace test-ns"*
 - *"Deploy a PostgreSQL database with persistent storage in the production namespace"*
-- *"Deploy a MySQL database with persistent storage in the production namespace"*
 - *"Create a service mesh configuration for microservices communication"*
 - *"Set up a horizontal pod autoscaler for the web application"*
 - *"Create network policies to secure pod-to-pod communication"*
@@ -354,11 +352,7 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
 - *"Benchmark container startup times and resource allocation"*
 - *"Test cluster recovery scenarios and failover mechanisms"*
 
-## 📚 Documentation
-
-- **[User Guide](MCP-TOOLS-USER-GUIDE.md)** - Comprehensive guide with practical examples and workflows
-
-### Available Tools
+## 📚 Available Tools
 
 1. **check_cluster_health**
    - Check overall OpenShift cluster health
@@ -613,7 +607,6 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
   }
 }
 ```
-```
 
 ## Examples
 
@@ -625,7 +618,7 @@ For detailed examples of extending the MCP server with performance testing capab
 
 This example demonstrates how to:
 - Add remote performance testing capabilities
-- Execute benchmarks through AI chatbots
+- Execute benchmarks through AI assistants
 - Collect and analyze performance metrics
 - Implement best practices for different cluster types
 
@@ -636,24 +629,22 @@ This example demonstrates how to:
 ```
 openshift-mcp-server/
 ├── index.js                    # Main MCP server implementation
-├── simple-remote-launcher.js   # Enhanced remote launcher for bastion hosts
-├── package.json               # Node.js dependencies and scripts
-├── package-lock.json          # Dependency lock file
-├── README.md                  # This file
-├── .gitignore                 # Git ignore patterns
-├── backup/                    # Backup files (for reference)
-│   ├── README.md              # Backup documentation
-│   └── remote-mcp-wrapper.sh.backup # Original shell script (replaced)
-├── scripts/                   # Utility scripts
-│   └── setup-bastion.sh      # Bastion host setup script
-├── docker/                   # Docker configuration
-│   ├── Dockerfile            # Container image definition
-│   └── docker-compose.yml    # Development setup
-└── kubernetes/               # Kubernetes deployment manifests
-    ├── deployment.yaml       # Server deployment
-    ├── service.yaml          # Service definition
-    ├── configmap.yaml        # Configuration
-    └── rbac.yaml             # RBAC permissions
+├── package.json                # Node.js dependencies and scripts
+├── package-lock.json           # Dependency lock file
+├── README.md                   # Documentation
+├── LICENSE                     # Project license
+├── docs/                       # Documentation
+│   ├── CONTRIBUTING.md         # Contribution guidelines
+│   ├── kube-burner-example.md  # Kube-burner testing guide
+│   └── private-cluster-config.md # Private cluster configuration
+├── examples/                   # Configuration examples
+│   └── cursor-mcp-config.example.json # Example MCP client config
+├── scripts/                    # Utility scripts
+│   ├── setup-bastion.sh        # Bastion host setup script
+│   └── remote-launcher.js # Remote launcher for bastion hosts
+└── docker/                     # Docker configuration
+    ├── Dockerfile              # Container image definition
+    └── docker-compose.yml      # Development setup
 ```
 
 ### Adding New Tools
@@ -770,7 +761,7 @@ ISC License - see package.json for details
   "mcpServers": {
     "openshift-mcp-server": {
       "command": "node",
-      "args": ["/path/to/openshift-mcp-server/simple-remote-launcher.js"],
+      "args": ["/path/to/openshift-mcp-server/remote-launcher.js"],
       "env": {
         "MCP_BASTION_HOST": "your-bastion-host.com",
         "MCP_BASTION_USER": "admin",
@@ -791,7 +782,7 @@ ISC License - see package.json for details
   "mcpServers": {
     "openshift-mcp-server": {
       "command": "node",
-      "args": ["/path/to/openshift-mcp-server/simple-remote-launcher.js"],
+      "args": ["/path/to/openshift-mcp-server/remote-launcher.js"],
       "env": {
         "MCP_BASTION_HOST": "your-bastion-host.com",
         "MCP_BASTION_USER": "admin",

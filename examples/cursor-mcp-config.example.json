@@ -10,7 +10,7 @@
     },
     "openshift_mcp_server_ssh_key": {
       "command": "node",
-      "args": ["/path/to/openshift-mcp-server/scripts/simple-remote-launcher.js"],
+      "args": ["/path/to/openshift-mcp-server/scripts/remote-launcher.js"],
       "env": {
         "MCP_BASTION_HOST": "your-bastion-host.com",
         "MCP_BASTION_USER": "admin",
@@ -22,7 +22,7 @@
     },
     "openshift_mcp_server_password": {
       "command": "node",
-      "args": ["/path/to/openshift-mcp-server/scripts/simple-remote-launcher.js"],
+      "args": ["/path/to/openshift-mcp-server/scripts/remote-launcher.js"],
       "env": {
         "MCP_BASTION_HOST": "your-bastion-host.com",
         "MCP_BASTION_USER": "admin",
