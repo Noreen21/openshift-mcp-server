@@ -15,7 +15,7 @@ A Model Context Protocol (MCP) server for monitoring and managing OpenShift/Kube
 
 ### Deployment & Configuration Management
 - **Application Deployment**: Create deployments with guaranteed QoS and resource management
-- **Database Services**: Deploy MySQL, MongoDB, or Redis with persistent storage
+- **Database Services**: Deploy PostgreSQL, MySQL, MongoDB, or Redis with persistent storage
 - **Auto-scaling**: Set up horizontal pod autoscalers with CPU/memory targets
 - **Service Management**: Create and configure services (ClusterIP, NodePort, LoadBalancer)
 - **Network Security**: Create network policies for secure pod-to-pod communication
@@ -25,7 +25,7 @@ A Model Context Protocol (MCP) server for monitoring and managing OpenShift/Kube
 - **Storage Benchmarks**: Run FIO workloads for sequential/random read/write performance testing
 - **Network Testing**: Test network throughput, latency, and packet loss with iperf3
 - **Resource Stress Testing**: Perform CPU and memory stress testing on worker nodes
-- **Database Benchmarking**: Execute MySQL performance tests with sysbench
+- **Database Benchmarking**: Execute PostgreSQL (pgbench) or MySQL (sysbench) performance tests
 
 ### Remote Execution Capabilities for Advanced Performance Testing and Benchmarking
 - **Bastion Host Support**: Execute tests on private clusters through jump hosts
@@ -335,6 +335,7 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
 
 #### Deployment & Configuration Management
 - *"Create a new deployment with guaranteed QoS using 4 CPU cores in namespace test-ns"*
+- *"Deploy a PostgreSQL database with persistent storage in the production namespace"*
 - *"Deploy a MySQL database with persistent storage in the production namespace"*
 - *"Create a service mesh configuration for microservices communication"*
 - *"Set up a horizontal pod autoscaler for the web application"*
@@ -347,6 +348,7 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
 - *"Run storage performance benchmarks using FIO workloads"*
 - *"Test network throughput between pods using iperf3"*
 - *"Perform CPU and memory stress testing on worker nodes"*
+- *"Execute PostgreSQL database performance tests with pgbench"*
 - *"Execute MySQL database performance tests with sysbench"*
 - *"Run comprehensive cluster health validation before production deployment"*
 - *"Benchmark container startup times and resource allocation"*
@@ -402,7 +404,7 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
 
 11. **deploy_database**
     - Deploy a database with persistent storage
-    - Parameters: `type` (string: mysql|mongodb|redis, required), `name` (string, required), `namespace` (string, default: "default"), `storageSize` (string, default: "10Gi"), `resources` (object, optional)
+    - Parameters: `type` (string: postgresql|mysql|mongodb|redis, required), `name` (string, required), `namespace` (string, default: "default"), `storageSize` (string, default: "10Gi"), `resources` (object, optional)
 
 12. **create_hpa**
     - Set up a horizontal pod autoscaler for an application
@@ -435,8 +437,8 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
     - Parameters: `testType` (string: cpu|memory|combined, default: "combined"), `duration` (string, default: "2m"), `cpuCores` (number, default: 2), `memorySize` (string, default: "1G"), `nodeSelector` (object, optional)
 
 19. **run_database_benchmark**
-    - Execute MySQL database performance tests with sysbench
-    - Parameters: `dbType` (string: mysql, required), `testType` (string: oltp_read_write|oltp_read_only|oltp_write_only, default: "oltp_read_write"), `threads` (number, default: 10), `duration` (string, default: "60s"), `tableSize` (number, default: 100000)
+    - Execute database performance tests with sysbench (MySQL) or pgbench (PostgreSQL)
+    - Parameters: `dbType` (string: postgresql|mysql, required), `testType` (string: oltp_read_write|oltp_read_only|oltp_write_only, default: "oltp_read_write"), `threads` (number, default: 10), `duration` (string, default: "60s"), `tableSize` (number, default: 100000)
 
 ## Example Usage with MCP Client
 
@@ -491,6 +493,20 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
   }
 }
 
+// Deploy PostgreSQL database
+{
+  "method": "tools/call",
+  "params": {
+    "name": "deploy_database",
+    "arguments": {
+      "type": "postgresql",
+      "name": "app-database",
+      "namespace": "production",
+      "storageSize": "20Gi"
+    }
+  }
+}
+
 // Deploy MySQL database
 {
   "method": "tools/call",
@@ -498,7 +514,7 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
     "name": "deploy_database",
     "arguments": {
       "type": "mysql",
-      "name": "app-database",
+      "name": "mysql-db",
       "namespace": "production",
       "storageSize": "20Gi"
     }
@@ -563,6 +579,36 @@ Once the MCP server is configured in your AI Code Assistant, you can interact wi
       "duration": "5m",
       "cpuCores": 4,
       "memorySize": "2G"
+    }
+  }
+}
+
+// PostgreSQL database benchmark
+{
+  "method": "tools/call",
+  "params": {
+    "name": "run_database_benchmark",
+    "arguments": {
+      "dbType": "postgresql",
+      "testType": "oltp_read_write",
+      "threads": 10,
+      "duration": "60s",
+      "tableSize": 100000
+    }
+  }
+}
+
+// MySQL database benchmark
+{
+  "method": "tools/call",
+  "params": {
+    "name": "run_database_benchmark",
+    "arguments": {
+      "dbType": "mysql",
+      "testType": "oltp_read_write",
+      "threads": 10,
+      "duration": "60s",
+      "tableSize": 100000
     }
   }
 }

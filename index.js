@@ -347,8 +347,8 @@ class OpenShiftMCPServer {
               properties: {
                 type: {
                   type: "string",
-                  enum: ["mysql", "mongodb", "redis"],
-                  description: "Database type"
+                  enum: ["postgresql", "mysql", "mongodb", "redis"],
+                  description: "Database type (storage uses emptyDir - data is ephemeral)"
                 },
                 name: {
                   type: "string",
@@ -626,14 +626,14 @@ class OpenShiftMCPServer {
            },
            {
              name: "run_database_benchmark",
-             description: "Execute MySQL database performance tests with sysbench",
+             description: "Execute database performance tests with sysbench (MySQL) or pgbench (PostgreSQL)",
              inputSchema: {
                type: "object",
                properties: {
                  dbType: {
                    type: "string",
-                   enum: ["mysql"],
-                   description: "Database type to test (MySQL only)"
+                   enum: ["postgresql", "mysql"],
+                   description: "Database type to test"
                  },
                  testType: {
                    type: "string",
@@ -901,8 +901,8 @@ class OpenShiftMCPServer {
         }
         break;
       case 'run_database_benchmark':
-        if (!args.dbType || args.dbType !== 'mysql') {
-          throw new Error('dbType is required and must be mysql');
+        if (!args.dbType || !['postgresql', 'mysql'].includes(args.dbType)) {
+          throw new Error('dbType is required and must be postgresql or mysql');
         }
         break;
     }
@@ -2258,7 +2258,8 @@ ${ports.map(port => `        - containerPort: ${port.containerPort}
           envVars: [
             { name: 'POSTGRES_DB', value: name },
             { name: 'POSTGRES_USER', value: 'postgres' },
-            { name: 'POSTGRES_PASSWORD', value: 'postgres123' }
+            { name: 'POSTGRES_PASSWORD', value: 'postgres123' },
+            { name: 'PGDATA', value: '/var/lib/postgresql/data/pgdata' }
           ]
         },
         mysql: {
@@ -2300,22 +2301,9 @@ ${ports.map(port => `        - containerPort: ${port.containerPort}
         }
       }
 
-      // Create PVC using K8s API
-      const pvc = {
-        metadata: {
-          name: `${name}-storage`
-        },
-        spec: {
-          accessModes: ['ReadWriteOnce'],
-          resources: {
-            requests: {
-              storage: storageSize
-            }
-          }
-        }
-      };
-
-      await this.k8sApi.createNamespacedPersistentVolumeClaim({namespace, body: pvc});
+      // Note: Using emptyDir for storage to avoid PVC binding issues on OpenShift
+      // Data will be ephemeral (lost on pod restart) but deployment will work without storage class
+      // For production use, configure a proper StorageClass or use PVC with pre-provisioned PVs
 
       // Create Deployment
       const deployment = {
@@ -2360,7 +2348,8 @@ ${ports.map(port => `        - containerPort: ${port.containerPort}
                       name: 'data',
                       mountPath: type === 'postgresql' ? '/var/lib/postgresql/data' :
                                 type === 'mysql' ? '/var/lib/mysql' :
-                                type === 'mongodb' ? '/data/db' : '/data'
+                                type === 'mongodb' ? '/data/db' : '/data',
+                      ...(type === 'postgresql' ? { subPath: 'pgdata' } : {})
                     }
                   ],
                   resources: {
@@ -2378,9 +2367,7 @@ ${ports.map(port => `        - containerPort: ${port.containerPort}
               volumes: [
                 {
                   name: 'data',
-                  persistentVolumeClaim: {
-                    claimName: `${name}-storage`
-                  }
+                  emptyDir: {}
                 }
               ]
             }
@@ -3930,7 +3917,101 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
       debugLog(`Starting database deployment for ${dbType}`);
       
       let dbDeployment, dbService;
-      if (dbType === 'mysql') {
+      if (dbType === 'postgresql') {
+        dbDeployment = {
+          metadata: {
+            name: 'postgres-db',
+            namespace: testNamespace
+          },
+          spec: {
+            replicas: 1,
+            selector: {
+              matchLabels: {
+                app: 'postgres-db'
+              }
+            },
+            template: {
+              metadata: {
+                labels: {
+                  app: 'postgres-db'
+                }
+              },
+              spec: {
+                containers: [
+                  {
+                    name: 'postgresql',
+                    image: 'postgres:13',
+                    env: [
+                      { name: 'POSTGRES_DB', value: 'postgres' },
+                      { name: 'POSTGRES_USER', value: 'postgres' },
+                      { name: 'POSTGRES_PASSWORD', value: 'postgres123' },
+                      { name: 'PGDATA', value: '/var/lib/postgresql/data/pgdata' }
+                    ],
+                    ports: [{ containerPort: 5432 }],
+                    volumeMounts: [
+                      {
+                        name: 'data',
+                        mountPath: '/var/lib/postgresql/data',
+                        subPath: 'pgdata'
+                      }
+                    ],
+                    resources: {
+                      requests: {
+                        cpu: '250m',
+                        memory: '512Mi'
+                      },
+                      limits: {
+                        cpu: '1000m',
+                        memory: '1Gi'
+                      }
+                    },
+                    readinessProbe: {
+                      tcpSocket: {
+                        port: 5432
+                      },
+                      initialDelaySeconds: 15,
+                      periodSeconds: 5,
+                      timeoutSeconds: 3,
+                      failureThreshold: 5
+                    },
+                    livenessProbe: {
+                      tcpSocket: {
+                        port: 5432
+                      },
+                      initialDelaySeconds: 60,
+                      periodSeconds: 10,
+                      timeoutSeconds: 5,
+                      failureThreshold: 6
+                    }
+                  }
+                ],
+                volumes: [
+                  {
+                    name: 'data',
+                    emptyDir: {}
+                  }
+                ]
+              }
+            }
+          }
+        };
+        
+        dbService = {
+          metadata: {
+            name: serviceName,
+            namespace: testNamespace
+          },
+          spec: {
+            selector: {
+              app: 'postgres-db'
+            },
+            ports: [{
+              port: 5432,
+              targetPort: 5432
+            }]
+          }
+        };
+      } else if (dbType === 'mysql') {
         dbDeployment = {
           metadata: {
             name: 'mysql-db',
@@ -3959,6 +4040,22 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
                       { name: 'MYSQL_DATABASE', value: 'test' }
                     ],
                     ports: [{ containerPort: 3306 }],
+                    volumeMounts: [
+                      {
+                        name: 'data',
+                        mountPath: '/var/lib/mysql'
+                      }
+                    ],
+                    resources: {
+                      requests: {
+                        cpu: '250m',
+                        memory: '512Mi'
+                      },
+                      limits: {
+                        cpu: '1000m',
+                        memory: '1Gi'
+                      }
+                    },
                     readinessProbe: {
                       tcpSocket: {
                         port: 3306
@@ -3977,6 +4074,12 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
                       timeoutSeconds: 5,
                       failureThreshold: 6
                     }
+                  }
+                ],
+                volumes: [
+                  {
+                    name: 'data',
+                    emptyDir: {}
                   }
                 ]
               }
@@ -4045,9 +4148,9 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
 
       // Wait for database pod to be ready (check pod status instead of fixed wait)
       debugLog('Waiting for database pod to be ready...');
-      const dbDeploymentName = 'mysql-db';
+      const dbDeploymentName = dbType === 'postgresql' ? 'postgres-db' : 'mysql-db';
       let dbReady = false;
-      const maxWaitTime = 120; // 2 minutes for MySQL
+      const maxWaitTime = dbType === 'postgresql' ? 180 : 120; // 3 min for PostgreSQL, 2 min for MySQL
       
       for (let i = 0; i < maxWaitTime; i++) {
         try {
@@ -4094,9 +4197,16 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
       // Give database a few more seconds to be fully ready for connections
       await new Promise(resolve => setTimeout(resolve, 10000));
       
-      // MySQL benchmark command
-      const mysqlCmd = `sleep 10 && sysbench ${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} prepare && sysbench ${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} run`;
-      const benchmarkCommand = ['sh', '-c', mysqlCmd];
+      let benchmarkCommand;
+      if (dbType === 'postgresql') {
+        // Separate pgbench initialization from benchmark run
+        const pgCmd = `sleep 5 && PGPASSWORD=postgres123 pgbench -h ${serviceName} -p 5432 -U postgres -i postgres && PGPASSWORD=postgres123 pgbench -h ${serviceName} -p 5432 -U postgres -c ${threads} -j ${Math.min(threads, 4)} -T ${durationSeconds} postgres`;
+        benchmarkCommand = ['sh', '-c', pgCmd];
+      } else if (dbType === 'mysql') {
+        // MySQL benchmark command
+        const mysqlCmd = `sleep 10 && sysbench ${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} prepare && sysbench ${testType} --mysql-host=${serviceName} --mysql-port=3306 --mysql-user=root --mysql-password=mysql123 --mysql-db=test --threads=${threads} --time=${durationSeconds} --table-size=${tableSize} run`;
+        benchmarkCommand = ['sh', '-c', mysqlCmd];
+      }
 
       const job = {
         apiVersion: 'batch/v1',
@@ -4111,7 +4221,7 @@ ${Object.entries(nodeSelector).map(([k, v]) => `        ${k}: ${v}`).join('\n')}
               containers: [
                 {
                   name: 'benchmark',
-                  image: 'perconalab/sysbench',
+                  image: dbType === 'postgresql' ? 'postgres:13' : 'perconalab/sysbench',
                   command: benchmarkCommand
                 }
               ],
@@ -4208,7 +4318,8 @@ ${commandYaml}
         
         // Clean up database deployment and service
         const appsApi = this.kubeConfig.makeApiClient(k8s.AppsV1Api);
-        await appsApi.deleteNamespacedDeployment({name: 'mysql-db', namespace: testNamespace});
+        const dbDeploymentName = dbType === 'postgresql' ? 'postgres-db' : 'mysql-db';
+        await appsApi.deleteNamespacedDeployment({name: dbDeploymentName, namespace: testNamespace});
         await this.k8sApi.deleteNamespacedService({name: serviceName, namespace: testNamespace});
       } catch (cleanupError) {
         console.error('Cleanup warning:', cleanupError.message);
